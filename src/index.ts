@@ -6,6 +6,25 @@ import { FacadeCore } from "./facade/facade-core.js";
 import { OpenAICompatAdapter } from "./adapters/openai-compat.js";
 import { createMessage, FacadeError, type ContentBlock } from "./types/index.js";
 
+// --- Wire format → Facade type mapping (snake_case → camelCase) ---
+
+function wireBlockToFacade(block: Record<string, unknown>): ContentBlock {
+  switch (block.type) {
+    case "text":
+      return { type: "text", text: block.text as string };
+    case "tool_use":
+      return { type: "tool_use", toolUseId: block.tool_use_id as string, name: block.name as string, input: block.input as Record<string, unknown> };
+    case "tool_result":
+      return { type: "tool_result", toolUseId: block.tool_use_id as string, content: (block.content as Record<string, unknown>[]).map(wireBlockToFacade) };
+    case "thinking":
+      return { type: "thinking", thinking: block.thinking as string, signature: block.signature as string };
+    case "image":
+      return { type: "image", mediaType: block.media_type as string, data: block.data as string | undefined, sourceUrl: block.source_url as string | undefined };
+    default:
+      return { type: "text", text: `[unknown block type: ${String(block.type)}]` };
+  }
+}
+
 // --- Bootstrap ---
 
 const registry = new ProviderRegistry();
@@ -30,7 +49,16 @@ server.tool(
     model: z.string().describe("Model identifier"),
     messages: z.array(z.object({
       role: z.enum(["system", "user", "assistant", "tool"]),
-      content: z.union([z.string(), z.array(z.any())]),
+      content: z.union([
+        z.string(),
+        z.array(z.discriminatedUnion("type", [
+          z.object({ type: z.literal("text"), text: z.string() }),
+          z.object({ type: z.literal("tool_use"), tool_use_id: z.string(), name: z.string(), input: z.record(z.string(), z.unknown()) }),
+          z.object({ type: z.literal("tool_result"), tool_use_id: z.string(), content: z.array(z.any()) }),
+          z.object({ type: z.literal("thinking"), thinking: z.string(), signature: z.string() }),
+          z.object({ type: z.literal("image"), media_type: z.string(), data: z.string().optional(), source_url: z.string().optional() }),
+        ])),
+      ]),
       tool_call_id: z.string().optional(),
     })).describe("Conversation messages"),
     max_tokens: z.number().int().positive().optional().describe("Maximum output tokens"),
@@ -40,9 +68,15 @@ server.tool(
   },
   async (params) => {
     try {
-      const messages = params.messages.map(m =>
-        createMessage(m.role, m.content as string | ContentBlock[], m.tool_call_id)
-      );
+      const messages = params.messages.map(m => {
+        let content: string | ContentBlock[];
+        if (typeof m.content === "string") {
+          content = m.content;
+        } else {
+          content = m.content.map(wireBlockToFacade);
+        }
+        return createMessage(m.role, content, m.tool_call_id);
+      });
 
       const response = await facade.complete(
         params.model,

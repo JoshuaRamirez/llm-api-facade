@@ -54,7 +54,9 @@ export function normalizeContent(content: string | ContentBlock[]): ContentBlock
 export function validateContentBlock(block: ContentBlock): void {
   switch (block.type) {
     case "text":
-      // text may be empty string (streaming deltas), field must exist
+      if (typeof block.text !== "string") {
+        throw new Error("TextBlock: text field must be a string");
+      }
       break;
 
     case "tool_use":

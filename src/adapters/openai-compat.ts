@@ -89,6 +89,7 @@ export class OpenAICompatAdapter implements CompletionProvider {
   }
 
   async *completeStream(request: NormalizedRequest): AsyncIterable<CompletionChunk> {
+    const correlationId = `str_${Date.now().toString(36)}`;
     const wireRequest = { ...this.translateRequest(request), stream: true };
 
     const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
@@ -103,13 +104,14 @@ export class OpenAICompatAdapter implements CompletionProvider {
     }
 
     if (!response.body) {
-      throw new FacadeError("system.provider_error", "NO_STREAM_BODY", "No response body for stream", "stream", true);
+      throw new FacadeError("system.provider_error", "NO_STREAM_BODY", "No response body for stream", correlationId, true);
     }
 
     const completionId = `cpl_${Date.now().toString(36)}`;
     let chunkIndex = 0;
     let outputTokenEstimate = 0;
     let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+    let usageEmitted = false;
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -124,81 +126,126 @@ export class OpenAICompatAdapter implements CompletionProvider {
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data: ")) continue;
-          const payload = trimmed.slice(6);
-          if (payload === "[DONE]") return;
+        yield* this.processSSELines(lines, completionId, chunkIndex, outputTokenEstimate, lastUsage, usageEmitted,
+          (ci, ote, lu, ue) => { chunkIndex = ci; outputTokenEstimate = ote; lastUsage = lu; usageEmitted = ue; });
+      }
 
-          let chunk: OpenAIStreamChunk;
-          try {
-            chunk = JSON.parse(payload) as OpenAIStreamChunk;
-          } catch {
-            throw new FacadeError(
-              "process.stream_interrupted",
-              "MALFORMED_STREAM_CHUNK",
-              "Failed to parse streaming chunk as JSON",
-              completionId,
-              true,
-            );
-          }
+      // Flush remaining buffer (handles missing trailing newline after [DONE])
+      if (buffer.trim()) {
+        yield* this.processSSELines([buffer], completionId, chunkIndex, outputTokenEstimate, lastUsage, usageEmitted,
+          (ci, ote, lu, ue) => { chunkIndex = ci; outputTokenEstimate = ote; lastUsage = lu; usageEmitted = ue; });
+      }
 
-          const choice = chunk.choices[0];
-          if (!choice) continue;
-
-          if (chunk.usage) {
-            lastUsage = chunk.usage;
-          }
-
-          const delta = choice.delta;
-          const finishReason = choice.finish_reason ? this.mapFinishReason(choice.finish_reason) : undefined;
-
-          // Tool call deltas
-          if (delta.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              yield {
-                completionId,
-                chunkIndex: chunkIndex++,
-                blockIndex: tc.index + 1, // block 0 is text, tool calls start at 1
-                delta: {
-                  type: "tool_use_delta" as const,
-                  toolUseId: tc.id,
-                  name: tc.function?.name,
-                  inputJsonDelta: tc.function?.arguments ?? "",
-                },
-                finishReason,
-              };
-            }
-          }
-
-          // Text content delta
-          if (delta.content !== null && delta.content !== undefined) {
-            outputTokenEstimate++;
-            yield {
-              completionId,
-              chunkIndex: chunkIndex++,
-              blockIndex: 0,
-              delta: { type: "text_delta" as const, text: delta.content },
-              finishReason,
-            };
-          } else if (finishReason && !delta.tool_calls) {
-            // Final chunk — ensure usage is present per invariant
-            yield {
-              completionId,
-              chunkIndex: chunkIndex++,
-              blockIndex: 0,
-              delta: { type: "text_delta" as const, text: "" },
-              finishReason,
-              usage: lastUsage
-                ? createUsage(lastUsage.prompt_tokens, lastUsage.completion_tokens, false)
-                : createUsage(0, outputTokenEstimate, true),
-            };
-          }
-        }
+      // Guarantee final usage chunk if stream ended without one
+      if (!usageEmitted && chunkIndex > 0) {
+        yield {
+          completionId,
+          chunkIndex,
+          blockIndex: 0,
+          delta: { type: "text_delta" as const, text: "" },
+          finishReason: FinishReason.Stop,
+          usage: lastUsage
+            ? createUsage(lastUsage.prompt_tokens, lastUsage.completion_tokens, false)
+            : createUsage(0, outputTokenEstimate, true),
+        };
       }
     } finally {
       reader.releaseLock();
     }
+  }
+
+  private *processSSELines(
+    lines: string[],
+    completionId: string,
+    chunkIndex: number,
+    outputTokenEstimate: number,
+    lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined,
+    usageEmitted: boolean,
+    setState: (ci: number, ote: number, lu: typeof lastUsage, ue: boolean) => void,
+  ): Generator<CompletionChunk> {
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6);
+      if (payload === "[DONE]") {
+        setState(chunkIndex, outputTokenEstimate, lastUsage, usageEmitted);
+        return;
+      }
+
+      let chunk: OpenAIStreamChunk;
+      try {
+        chunk = JSON.parse(payload) as OpenAIStreamChunk;
+      } catch {
+        throw new FacadeError(
+          "process.stream_interrupted",
+          "MALFORMED_STREAM_CHUNK",
+          "Failed to parse streaming chunk as JSON",
+          completionId,
+          true,
+        );
+      }
+
+      const choice = chunk.choices[0];
+      if (!choice) continue;
+
+      if (chunk.usage) {
+        lastUsage = chunk.usage;
+      }
+
+      const delta = choice.delta;
+      const finishReason = choice.finish_reason ? this.mapFinishReason(choice.finish_reason) : undefined;
+
+      // Tool call deltas — finishReason only on the last one
+      if (delta.tool_calls) {
+        for (let i = 0; i < delta.tool_calls.length; i++) {
+          const tc = delta.tool_calls[i]!;
+          const isLast = i === delta.tool_calls.length - 1;
+          const tcIndex = typeof tc.index === "number" && tc.index >= 0 ? tc.index : 0;
+          yield {
+            completionId,
+            chunkIndex: chunkIndex++,
+            blockIndex: tcIndex + 1,
+            delta: {
+              type: "tool_use_delta" as const,
+              toolUseId: tc.id,
+              name: tc.function?.name,
+              inputJsonDelta: tc.function?.arguments ?? "",
+            },
+            // Only attach finishReason to the very last delta in this wire chunk
+            finishReason: isLast && !delta.content ? finishReason : undefined,
+          };
+        }
+      }
+
+      // Text content delta
+      if (delta.content !== null && delta.content !== undefined) {
+        outputTokenEstimate++;
+        yield {
+          completionId,
+          chunkIndex: chunkIndex++,
+          blockIndex: 0,
+          delta: { type: "text_delta" as const, text: delta.content },
+          // Only attach finishReason if there were no tool_calls in this chunk
+          finishReason: !delta.tool_calls ? finishReason : undefined,
+        };
+      }
+
+      // Emit final usage chunk when finishReason is present
+      if (finishReason && !usageEmitted) {
+        usageEmitted = true;
+        yield {
+          completionId,
+          chunkIndex: chunkIndex++,
+          blockIndex: 0,
+          delta: { type: "text_delta" as const, text: "" },
+          finishReason,
+          usage: lastUsage
+            ? createUsage(lastUsage.prompt_tokens, lastUsage.completion_tokens, false)
+            : createUsage(0, outputTokenEstimate, true),
+        };
+      }
+    }
+    setState(chunkIndex, outputTokenEstimate, lastUsage, usageEmitted);
   }
 
   // --- Translation: Facade → Wire ---
@@ -299,7 +346,7 @@ export class OpenAICompatAdapter implements CompletionProvider {
   private translateResponse(data: OpenAIChatCompletion): CompletionResponse {
     const choice = data.choices[0];
     if (!choice) {
-      throw new FacadeError("system.provider_error", "NO_CHOICES", "No choices in response", "translate", true);
+      throw new FacadeError("system.provider_error", "NO_CHOICES", "No choices in response", `err_${Date.now().toString(36)}`, true);
     }
 
     const content: ContentBlock[] = [];
@@ -351,7 +398,9 @@ export class OpenAICompatAdapter implements CompletionProvider {
       case "content_filter": return FinishReason.ContentFilter;
       case "tool_calls": return FinishReason.ToolUse;
       case "tool": return FinishReason.ToolUse;
-      default: return FinishReason.Stop;
+      default:
+        console.error(`[${this.providerId}] unknown finish_reason: '${raw}', mapping to stop`);
+        return FinishReason.Stop;
     }
   }
 
