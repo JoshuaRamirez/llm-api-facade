@@ -4,7 +4,7 @@
 > evolves. This document exists to help future sessions know where to look first
 > when the taxonomy feels stale.
 
-**Status:** Active reference
+**Status:** Active reference (13/13 resolved or positioned)
 **Last updated:** 2026-03-26
 **Depends on:** `OntologicalTaxonomy.md`, `DomainModel.md`, `McpServerSpec.md`, cross-validation findings from OpenAI/Anthropic/Gemini/Mistral/Cohere/xAI/Local agents
 **Purpose:** Intellectual honesty about where the model is weakest. Named by likelihood, severity, and seam-boundary impact.
@@ -69,6 +69,16 @@ If the facade ships with `content: string` and the taxonomy is not revised in ti
 
 This is the single highest-priority soft spot because it affects every type that crosses the seam.
 
+### Resolution
+
+**Status:** RESOLVED
+**Resolved by:** ADR-003 (Content Blocks Replace String as Facade Content Type)
+**Date resolved:** 2026-03-27
+
+ADR-003 replaced `content: string` with `content: ContentBlock[]` as the facade's content type for both messages and completions. ContentBlock is a discriminated union with five variants: TextBlock (Core), ToolUseBlock (Extended Tier 1), ToolResultBlock (Extended Tier 1), ThinkingBlock (Extended Tier 2), and ImageBlock (Extended Tier 2). The string shorthand is preserved at API boundaries as a convenience constructor that expands to `[TextBlock { text: <the string> }]`. The DomainModel, TypeSpecification, McpServerSpec, and OntologicalTaxonomy have all been updated to reflect this.
+
+**Residual risk:** None. The internal inconsistency that motivated this soft spot no longer exists.
+
 ---
 
 ## Soft Spot 2: Token Accounting Assumes Simple Arithmetic
@@ -110,6 +120,16 @@ Extended thinking / chain-of-thought is becoming standard, not rare. The Anthrop
 - `validate_request` produces false positives: it says the request fits but the model exhausts its budget on reasoning.
 - Cost attribution breaks: a caller paying per-output-token has no visibility into the reasoning tax.
 - The `usage` type in the seam contract (`CompletionResponse`) must grow to include reasoning tokens -- a seam-level type change.
+
+### Resolution
+
+**Status:** PARTIALLY RESOLVED
+**Resolved by:** ADR-004 (Thinking Promoted to Extended Tier 2), DomainModel revision (reasoning_effort as Generation Parameter, `is_approximate` on Usage)
+**Date resolved:** 2026-03-27
+
+The reclassification of reasoning to Extended Tier 2 (ADR-004) brought `reasoning_effort` into the facade's parameter set and `supports_thinking` into ModelCapabilities. The DomainModel now documents max_tokens semantics divergence for reasoning models. The `Usage` type carries `is_approximate` to signal when token counts are estimates.
+
+**Residual risk:** The `Usage` type still has only `{input_tokens, output_tokens, is_approximate}`. It does not carry a separate `reasoning_tokens` field. When reasoning token reporting stabilizes across providers (currently Anthropic and OpenAI report them differently), Usage will need an optional `reasoning_tokens` field. The context window formula `effective_input_limit = context_window - max_output_tokens` remains an approximation for reasoning models. Both are tracked as future refinements, not architectural risks.
 
 ---
 
@@ -161,6 +181,16 @@ The industry is converging on a common conceptual model even as wire formats dif
 - If tool calling enters the facade late, it creates a second parallel type system (tool-call types alongside completion types) that should have been integrated from the start.
 - The Message schema, the role enumeration, the finish_reason enumeration, and the CompletionResponse type all need revision simultaneously.
 
+### Resolution
+
+**Status:** RESOLVED
+**Resolved by:** ADR-005 (Tool Calling Promoted to Extended Tier 1), ToolCallingChoreography.md, TypeSpecification.md (ToolDefinition, ToolChoice, ToolUseBlock, ToolResultBlock, ToolUseDelta, tool role, tool_use finish reason)
+**Date resolved:** 2026-03-27
+
+ADR-005 promoted tool calling from the explicit exclusions list into the facade's type system as Extended Tier 1. All 7 interrelated concepts identified in this soft spot are now represented: ToolDefinition (name, description, input_schema), ToolChoice (auto/none/required/specific), ToolUseBlock and ToolResultBlock as ContentBlock variants, the `tool` role, the `tool_use` finish reason, tool_call_id/tool_use_id correlation, and parallel tool calling. The ToolCallingChoreography document specifies the exact translation from each provider's wire format into facade types. The DomainModel, TypeSpecification, and McpServerSpec have all been updated.
+
+**Residual risk:** Strict mode / schema enforcement (item 7 in the original list) remains a Layer 2 extension. It is currently OpenAI-specific (`strict: true`). If strict mode converges across providers, it becomes a graduation candidate.
+
 ---
 
 ## Soft Spot 4: Three Finish Reasons Collapse Eleven with Information Loss
@@ -201,6 +231,16 @@ As tool calling becomes standard and reasoning models proliferate, `tool_use` an
 - Callers cannot build correct control flow for agentic loops (they cannot distinguish "done" from "needs tool execution").
 - Callers cannot distinguish truncated output from complete output, leading to silent data loss.
 - The finish_reason enum is part of `CompletionResponse`, which crosses the seam -- any expansion is a seam-level change.
+
+### Resolution
+
+**Status:** RESOLVED
+**Resolved by:** TypeSpecification.md Section 2.2 FinishReason (expanded enumeration), ADR-005 (tool_use finish reason), DomainModel Section 1.2 (revised finish reasons)
+**Date resolved:** 2026-03-27
+
+The FinishReason enumeration was expanded from 3 to 5 values: `{stop, length, content_filter, tool_use, error}`. The internal inconsistency between the DomainModel (3 values), taxonomy (5 values), and MCP spec (mixed) has been resolved -- all documents now agree on the 5-value set. The TypeSpecification provides detailed invariants and provider mappings for each value. Gemini's `RECITATION` maps to `content_filter` (the broadest interpretation of content-based generation termination). Anthropic's `end_turn` and `stop_sequence` both map to `stop` (the facade does not distinguish natural completion from stop-sequence termination; the caller's stop_sequences are known to the caller, so the distinction is reconstructible).
+
+**Residual risk:** The `stop` value still conflates natural completion and stop-sequence hits. If consumers demonstrate a need to distinguish these programmatically, a future revision could split `stop` into `end_turn` and `stop_sequence`. This is low priority: the caller knows whether it set stop sequences and can infer which case applies.
 
 ---
 
@@ -244,6 +284,26 @@ As content blocks become the standard content model (Soft Spot 1), streaming mus
 - The streaming contract cannot represent multi-block output, forcing callers to parse and reassemble blocks from flat deltas with heuristics.
 - The `CompletionChunk` type that crosses the seam must be revised to carry block identity.
 - Streaming becomes the bottleneck for adopting content blocks, tool calling, and extended thinking at the facade level.
+
+### Resolution
+
+**Status:** RESOLVED (with one gap to close)
+**Resolved by:** TypeSpecification.md Section 1.4 (CompletionChunk), Section 1.5 (ContentBlockDelta as discriminated union), ToolCallingChoreography.md Section 2.7 (streaming accumulation per provider), ADR-003 (content blocks), ADR-005 (tool calling)
+**Date resolved:** 2026-03-27
+
+The core concern -- "flat deltas cannot represent multi-block output" -- has been addressed through three coordinated changes:
+
+1. **ContentBlockDelta is a discriminated union** (TypeSpec Section 1.5) with three typed variants: TextDelta, ToolUseDelta, and ThinkingDelta. Each chunk carries a typed delta, not a flat string. The caller knows what kind of content block is being streamed from the delta variant itself.
+
+2. **ToolUseDelta carries block identity within the variant.** The first ToolUseDelta for a given tool call carries `tool_use_id` and `name`; subsequent deltas for the same call carry `null` for both. This is sufficient for the caller to accumulate tool call arguments without ambiguity when only one tool call streams at a time.
+
+3. **ToolCallingChoreography Section 2.7** documents the exact streaming accumulation algorithm for each provider (OpenAI, Anthropic, Gemini, local runtimes). Each adapter translates provider-specific streaming events (Anthropic's `content_block_start`/`content_block_delta`/`content_block_stop`, OpenAI's `tool_calls[index]`, Gemini's single-frame `functionCall`, Ollama's final-message tool calls) into the facade's ToolUseDelta model.
+
+**Gap identified: `block_index` is missing from CompletionChunk.** The current CompletionChunk carries `{completion_id, chunk_index, delta, finish_reason, usage}`. It does not carry a `block_index` field that identifies which content block within the response the delta belongs to. When multiple content blocks stream concurrently -- for example, a TextBlock followed by two parallel ToolUseBlocks -- the caller needs `block_index` to route each delta to the correct accumulator. OpenAI uses `tool_calls[index]` and Anthropic uses `content_block_start.index` for exactly this purpose.
+
+**Required change:** Add `block_index: non-negative integer` to the CompletionChunk type in TypeSpecification.md Section 1.4. This field identifies which content block (by position in the eventual `content: ContentBlock[]` array) the delta contributes to. Chunks belonging to different content blocks may interleave in the stream. The `block_index` is assigned by the adapter during translation from provider-native events. This change must be made in the TypeSpecification, the DomainModel Section 1.5 streaming contract, and the McpServerSpec chunk schema.
+
+**Residual risk:** Low. The typed delta model absorbs the overwhelming majority of the streaming complexity. The `block_index` addition is a straightforward field addition with clear semantics, not an architectural change. Wire protocol differences (SSE vs. NDJSON) remain correctly classified as below-seam, absorbed by adapters.
 
 ---
 
@@ -293,6 +353,22 @@ Option 1 is the healthy path. Options 2 and 3 are the failure modes. The taxonom
 - The principle of Provider Opacity (Principle 1) is violated in practice: callers must know which provider they target to construct correct extension data.
 - The seam contract becomes structurally dishonest: `NormalizedRequest` suggests normalization, but the real payload is in the opaque bag.
 
+### Resolution
+
+**Status:** RESOLVED
+**Resolved by:** ADR-006 (Structured Extensions Replace Opaque Bag), combined with ADR-003 (content blocks), ADR-004 (thinking), ADR-005 (tool calling) graduating key features to Layer 1
+**Date resolved:** 2026-03-27
+
+Two complementary changes resolved this soft spot:
+
+1. **Graduated key features out of extensions into Layer 1.** Tool calling (ADR-005), content blocks including vision (ADR-003), and reasoning (ADR-004) are no longer extension territory. They are first-class facade types with validation, capability discovery, and normalization. This removed the three heaviest items from the extension bag.
+
+2. **Replaced the opaque bag with structured, typed extensions** (ADR-006). `provider_extensions: Map<string, any>` became `extensions: Map<ExtensionId, ExtensionValue>` where each extension has a registered identifier, JSON Schema, and description. Extensions are discoverable via `get_model_info` and validated by the facade against their schemas before dispatch. The bag is no longer opaque; it is a structured, discoverable, validated namespace for provider-specific features.
+
+The DomainModel Section 4.4 now defines the graduation criteria: extensions that converge across multiple providers may be promoted to Layer 1 through an ADR. Safety configuration, structured output, and prompt caching remain as structured extensions -- appropriate given their current divergence across providers.
+
+**Residual risk:** The structured extension system is only as good as its schemas. Poorly specified extension schemas could recreate the opaque bag problem within a typed wrapper. Extension schema quality is an ongoing operational concern, not an architectural risk.
+
 ---
 
 ## Soft Spot 7: Reasoning/Thinking Classified as Tier 3 (Rare)
@@ -333,6 +409,16 @@ Reasoning is moving from Tier 3 toward Tier 1. The conceptual model is convergin
 - Callers must use the extension bag to control reasoning effort, defeating normalization for one of the most impactful parameters.
 - Token accounting (Soft Spot 2) and reasoning configuration are coupled: you cannot accurately account for tokens without understanding the reasoning budget.
 - Capability discovery cannot report reasoning support because it is not in the capability model.
+
+### Resolution
+
+**Status:** RESOLVED
+**Resolved by:** ADR-004 (Extended Thinking Promoted from Below-Seam to Extended Tier 2), TypeSpecification.md (ReasoningEffort enum, ThinkingBlock, ThinkingDelta, `supports_thinking` capability), DomainModel revision (reasoning_effort as Generation Parameter)
+**Date resolved:** 2026-03-27
+
+ADR-004 reclassified extended thinking from Tier 3 (Rare, Below-Seam) to Extended Tier 2 (capability-gated). The facade now includes: a `ReasoningEffort` enumeration (`low`, `medium`, `high`) as a Generation Parameter, `supports_thinking` as a capability flag on ModelCapabilities, `ThinkingBlock` as a ContentBlock variant, and `ThinkingDelta` as a ContentBlockDelta variant for streaming. The integration plane maps the categorical effort levels to provider-specific mechanisms (Anthropic `thinking.budget_tokens` / `output_config.effort`, OpenAI `reasoning_effort`, Gemini `thinkingConfig`).
+
+**Residual risk:** The categorical model (`low`/`medium`/`high`) is a deliberate simplification of providers that offer numeric budget controls (Anthropic `budget_tokens`, Gemini `thinkingBudget`). If consumers need fine-grained numeric control, this would be exposed as a Layer 2 extension alongside the categorical Layer 1 parameter. Currently assessed as low risk because the industry is converging toward categorical levels.
 
 ---
 
@@ -376,6 +462,53 @@ As local and self-hosted inference grows (driven by cost, privacy, and latency r
 - The facade cannot participate in resource management for local runtimes, which may be the primary value of a facade in a local-only deployment.
 - The `model_unavailable` error category is semantically overloaded, violating Principle 6 (Fail Explicitly).
 
+### Resolution
+
+**Status:** POSITION TAKEN
+**Resolved by:** Formal position on model lifecycle architecture (documented below), with changes required in TypeSpecification.md, DomainModel.md, McpServerSpec.md, and OntologicalTaxonomy.md
+**Date resolved:** 2026-03-26
+
+**Position:**
+
+1. **Layer 1 discovery reports current state, not potential state.** The `list_models` and `get_model_info` tools report what is available NOW. A model that exists in the local runtime's catalog but is not loaded into memory reports as unavailable through Layer 1 discovery. This is consistent with the cloud API model where a decommissioned model simply does not appear.
+
+2. **Add `model_state` to the response of `get_model_info`.** A new type captures the readiness of a model:
+
+   ```
+   ModelReadiness {
+       state: "available" | "loading" | "unloading" | "not_loaded" | "unavailable"
+       estimated_ready_seconds: positive integer?   // present when state is "loading" or "not_loaded"
+   }
+   ```
+
+   - `available`: The model is loaded and ready to serve requests. Cloud models are always in this state.
+   - `loading`: The model is actively being loaded into memory. `estimated_ready_seconds` provides a forecast.
+   - `unloading`: The model is being evicted from memory (e.g., to make room for another model).
+   - `not_loaded`: The model exists in the runtime's catalog but is not loaded. It can be loaded on demand. `estimated_ready_seconds` estimates load time.
+   - `unavailable`: The model cannot serve requests and cannot be loaded (corrupt files, incompatible hardware, missing dependencies).
+
+   For cloud providers, the adapter always returns `{ state: "available" }`. The field is structurally present but trivially constant for cloud backends.
+
+3. **Define a `model_lifecycle` Layer 2 extension for local runtimes.** This extension exposes load/unload operations and reports loading progress. It is discoverable via `get_model_info` as an `ExtensionDescriptor` with id `model_lifecycle`. The extension's `input_schema` accepts `{ action: "load" | "unload" }` and the `response_schema` includes progress reporting. This is a Layer 2 extension because model lifecycle management is not universal -- it applies exclusively to local runtimes.
+
+4. **Refine the error taxonomy.** Split `model_unavailable` into two species:
+
+   | Code | Meaning | Retryable? |
+   |------|---------|------------|
+   | `precondition.model_not_found` | The model ID does not exist in any registered provider | No |
+   | `precondition.model_not_ready` | The model exists but is not loaded; includes `estimated_ready_seconds` when available | Conditional (retry after estimated wait) |
+
+   The existing `model_unavailable` becomes the genus; the two new codes are species beneath it. Existing consumers that match on `model_unavailable` continue to work because the genus-level match still applies. New consumers can match on the species for finer-grained handling.
+
+**Changes required:**
+- **TypeSpecification.md:** Add `ModelReadiness` type. Add `readiness: ModelReadiness` field to the `get_model_info` response shape. Add `model_not_found` and `model_not_ready` to the error code enumeration.
+- **DomainModel.md Section 2.2:** Add `readiness` to the capability discovery contract. Add a note that cloud adapters always return `state: "available"`.
+- **DomainModel.md Section 2.4:** Split `model_unavailable` into `model_not_found` and `model_not_ready` in the Precondition Failures table.
+- **McpServerSpec.md:** Update `get_model_info` output schema to include `readiness`. Update error code documentation.
+- **OntologicalTaxonomy.md Section 6.5:** Reclassify "Model load / unload" from purely "Below-Seam (infrastructure)" to "Below-Seam infrastructure with Layer 2 extension surface." Add `ModelReadiness` as a Layer 1 concept (it is universal -- cloud models simply have a trivially constant value).
+
+**Residual risk:** The `estimated_ready_seconds` field is inherently approximate. Model loading time depends on file size, disk speed, available memory, GPU state, and concurrent operations. The facade makes no guarantee about accuracy -- it is advisory information from the adapter. Consumers should treat it as a hint for UX purposes, not as a contract.
+
 ---
 
 ## Soft Spot 9: Safety as Fixed Binary vs. Configurable Spectrum
@@ -418,6 +551,16 @@ As regulatory requirements grow (EU AI Act, etc.), configurable safety settings 
 - The facade cannot report safety metadata (Gemini returns safety ratings on every response), losing information that may be operationally or legally required.
 - The binary model (filtered/not-filtered) cannot represent partial filtering or configurable thresholds.
 
+### Resolution
+
+**Status:** POSITION TAKEN
+**Resolved by:** Classification as Layer 2 structured extension (per ADR-006), OntologicalTaxonomy Section 1.1.4 revision
+**Date resolved:** 2026-03-27
+
+The dual nature of safety across providers makes it a textbook case for the Layer 2 structured extension pattern established by ADR-006. Per-request safety configuration (Gemini `safetySettings`) is exposed as a `safety_settings` extension with a defined schema. Safety response metadata (Gemini safety ratings) is exposed via `extension_data` on the response. The facade's Layer 1 position remains: safety as a constraint discovered by violation, with `content_filtered` as the normalized finish reason. The OntologicalTaxonomy Section 1.1.4 now acknowledges both modes: safety as fixed constraint (OpenAI, Anthropic) and safety as configurable parameter (Gemini, Layer 2 extension).
+
+**Residual risk:** If configurable safety converges across multiple providers (as regulatory pressure may cause), it becomes a graduation candidate from Layer 2 to Layer 1. Currently assessed as medium-term risk. The structured extension pattern means Gemini safety is no longer opaque or undiscoverable.
+
 ---
 
 ## Soft Spot 10: Structured Output Treated as Single Feature
@@ -459,6 +602,16 @@ Schema-enforced output is becoming the standard for programmatic LLM consumption
 - Callers cannot make informed decisions about output reliability.
 - The extension bag becomes the mechanism for structured output configuration, but the guarantee semantics are not discoverable through capability queries.
 - Testing and validation strategies differ by tier -- a caller using tier 3 needs schema validation; a caller using tier 1 needs fallback parsing.
+
+### Resolution
+
+**Status:** POSITION TAKEN
+**Resolved by:** Classification as Layer 2 structured extension (per ADR-006) with multi-tier guarantee semantics documented in extension schema
+**Date resolved:** 2026-03-27
+
+Structured output remains a Layer 2 extension -- the guarantee semantics diverge too much across providers for a single Layer 1 representation. Per ADR-006, it is a structured extension (id: `structured_output`) with a discoverable schema. The extension schema expresses the guarantee tier the model supports, not just a binary flag. The adapter reports which tiers are available, and the consumer selects the desired tier in the extension input. Grammar-based constraints (llama.cpp GBNF) are a separate extension (id: `grammar_constraint`) specific to local runtimes.
+
+**Residual risk:** If schema-enforced output converges across all three major cloud providers (which is occurring), it becomes a strong graduation candidate to Layer 1. The tier model (instructed < json_mode < schema_enforced) is stable enough to formalize. This should be re-evaluated within 6 months.
 
 ---
 
@@ -506,6 +659,27 @@ These advanced sampling methods are predominantly a local-runtime concern. Cloud
 
 This is below-seam and does not affect the facade's public interface, limiting its severity.
 
+### Resolution
+
+**Status:** POSITION TAKEN
+**Resolved by:** Formal position on pipeline scope and advanced sampling classification (documented below), with annotation required in OntologicalTaxonomy.md Section 3.1
+**Date resolved:** 2026-03-26
+
+**Position:**
+
+1. **The taxonomy's pipeline is a pedagogical model, not an execution specification.** The diagram `Raw Logits -> temperature -> softmax -> top_k -> top_p -> min_p -> sample` describes the canonical conceptual relationship between sampling parameters -- specifically, that temperature operates in logit space (pre-softmax) while top_k, top_p, and min_p operate in probability space (post-softmax). It establishes that these parameters compose sequentially and are not alternatives to each other. It does not prescribe the order in which an inference engine must apply them. Local runtimes may reorder the pipeline, and the facade neither guarantees nor constrains sampling order.
+
+2. **The facade's Layer 1 parameters remain the universal vocabulary.** `temperature`, `top_p`, and `top_k` are the portable sampling parameters. Their semantics (logit scaling, cumulative probability threshold, rank-order threshold) are stable across providers regardless of execution order. The facade normalizes these names; it does not normalize execution behavior.
+
+3. **Advanced sampling methods are Layer 2 extensions.** Mirostat, DRY, dynamic temperature, min_p, and configurable sampler chain ordering are classified as a `sampling_advanced` extension (or a family of related extensions). They are discoverable on models that support them via `get_model_info`. This classification acknowledges their existence and provides a structured mechanism for consumers to use them, without pretending they are universal.
+
+4. **Mirostat is categorically incompatible with the pipeline model.** Mirostat replaces the temperature/top_k/top_p pipeline with a perplexity-targeting algorithm. When mirostat is active, temperature/top_k/top_p parameters are either ignored or conflict. The `sampling_advanced` extension schema should document this mutual exclusion so that adapter implementors and consumers are aware of it.
+
+**Changes required:**
+- **OntologicalTaxonomy.md Section 3.1:** Add a clarifying note after the pipeline diagram: "This pipeline describes the canonical conceptual relationship between sampling parameters. It is a pedagogical model for understanding parameter interactions, not a specification of execution order. Local runtimes (llama.cpp, vLLM, text-generation-webui) may reorder the pipeline or replace it entirely with alternative sampling algorithms (mirostat, DRY). The facade does not guarantee or constrain the order in which an inference engine applies these parameters." Also add min_p, mirostat, DRY, and dynamic temperature to the parameter table with "Local runtimes, Layer 2 extension" annotation.
+
+**Residual risk:** Low. This soft spot is below-seam by nature. The position clarifies the taxonomy's claims without requiring any change to the facade's public interface. The primary benefit is preventing misunderstanding by adapter implementors.
+
 ---
 
 ## Soft Spot 12: Role Alternation Constraint Invisible
@@ -546,6 +720,37 @@ Option 2 is more consistent with the facade's principle of LCD + capability disc
 - False-positive validation: `validate_request` says the message sequence is valid but Anthropic rejects it.
 - Users targeting Anthropic through the facade are surprised by ordering rejections that the facade did not prevent.
 - The severity is limited because the error is still reported (Anthropic returns a clear error); it is just not caught early.
+
+### Resolution
+
+**Status:** POSITION TAKEN
+**Resolved by:** Formal position on validation layering and capability-advertised ordering constraints (documented below), with changes required in DomainModel.md and TypeSpecification.md
+**Date resolved:** 2026-03-26
+
+**Position:**
+
+1. **Layer 1 validation checks structural invariants, not provider-specific ordering.** The facade's `validate_request` tool performs Layer 1 validation: non-empty messages, valid roles, content block type invariants (ToolResultBlock only in tool-role messages, etc.), context window estimation. It does not enforce provider-specific message ordering because ordering constraints are not universal.
+
+2. **Provider-specific ordering constraints are validated by the adapter at the seam.** The Anthropic adapter validates alternation before dispatch. The Gemini adapter validates its own ordering rules. The OpenAI adapter imposes no ordering constraint. When an adapter rejects a message sequence for ordering violations, it returns a `validation_error` with a message that identifies the specific constraint (e.g., "Anthropic requires strict user/assistant role alternation; found consecutive user messages at positions 3 and 4"). This is consistent with Principle 6 (Fail Explicitly): the error is clear, actionable, and occurs before the request reaches the provider.
+
+3. **Add `requires_alternation` to ModelCapabilities.** A new boolean field on ModelCapabilities:
+
+   ```
+   requires_alternation: boolean   // true when the provider enforces strict user/assistant role alternation
+   ```
+
+   This lets consumers who want to pre-validate check the constraint before sending. It is a discoverable capability, consistent with the facade's pattern of making constraints explicit through capability discovery rather than hiding them until failure.
+
+4. **The ToolCallingChoreography already handles alternation for tool messages.** Anthropic tool results are embedded in user messages (ToolCallingChoreography Section 3.2), which naturally maintains alternation within tool-calling flows. The adapter ensures this structural compliance. Consumers building manual message sequences (without tool calling) are the primary audience for `requires_alternation`.
+
+5. **The facade does not enforce Anthropic's alternation on all providers.** Enforcing the strictest constraint universally would reject valid OpenAI requests and violate the principle that the facade abstracts commonality without imposing unnecessary restrictions. The constraint is provider-specific and is treated as such.
+
+**Changes required:**
+- **TypeSpecification.md Section 3.2 (ModelCapabilities):** Add `requires_alternation: boolean` field with invariant: "When true, the message sequence must alternate between user and assistant roles after an optional initial system message. Tool-role messages follow assistant messages containing ToolUseBlocks and do not count as violations."
+- **DomainModel.md Section 2.2:** Add `requires_alternation` to the capability table with the note: "Provider-specific constraint. True for Anthropic and Gemini. False for OpenAI, Mistral, Cohere, and most local runtimes."
+- **DomainModel.md Section 1.1:** Add a note to the Role Alternation paragraph: "The facade does not enforce alternation universally. Providers that require alternation advertise this via `requires_alternation` in ModelCapabilities. The adapter validates ordering at the seam and returns a `validation_error` with a clear message on violation."
+
+**Residual risk:** Low. The combination of capability-advertised constraints and adapter-level validation provides both discoverability and enforcement. The only gap is that `validate_request` cannot catch ordering violations without knowing the target model -- but `validate_request` already requires a model parameter, so it can look up `requires_alternation` and perform the check. This means `validate_request` can give accurate ordering feedback when implemented. No fundamental architectural change is needed.
 
 ---
 
@@ -588,25 +793,49 @@ If other providers follow Gemini's pattern (OpenAI's browsing and code interpret
 - The capability discovery model cannot report built-in tool availability.
 - The impact is low because built-in tools work through the extension bag and are currently a Gemini-specific feature.
 
+### Resolution
+
+**Status:** POSITION TAKEN
+**Resolved by:** Formal position on built-in tool classification and extension architecture (documented below), with taxonomy already partially updated
+**Date resolved:** 2026-03-26
+
+**Position:**
+
+1. **Vendor-provided built-in tools are Layer 2 extensions, not Layer 1 tool definitions.** They are ontologically distinct from user-defined tools: the caller does not define them, does not implement them, and does not receive their results through the tool-calling protocol. They are server-side capabilities of the model-provider pair. Representing them as ToolDefinitions in the `tools` parameter would be a category error -- they have no `input_schema` the caller controls and no `tool_use_id` the caller correlates.
+
+2. **Define a `built_in_tools` extension.** This structured extension (per ADR-006) exposes available vendor tools and allows enabling/disabling them per request. The extension's `input_schema` accepts an array of tool identifiers to enable (e.g., `["google_search", "code_execution"]`). The extension's `response_schema` includes tool-specific metadata (search grounding metadata, code execution output). This is discoverable via `get_model_info` for models that support built-in tools.
+
+3. **Built-in tool output remains below the seam in provider-native format.** Search grounding metadata (citations, URLs, relevance scores) and code execution output (stdout, stderr, exit code) appear in `extension_data` on the response, not in the normalized `content: ContentBlock[]`. The output schemas are too divergent and too provider-specific to normalize at Layer 1. The facade passes this data through the structured extension channel so consumers can use it, but does not pretend it is universal.
+
+4. **The taxonomy already classifies these correctly.** The OntologicalTaxonomy Section 2 (Function Taxonomy, Level 1 Species) includes "Augmented Generation" under the Generative Genus: "Generation enhanced by vendor-provided tools (search grounding, code execution) -- Not exposed at core (Tier 2/3, capability-gated)." This classification is accurate and sufficient. The `built_in_tools` extension is the mechanism through which this species is exposed to consumers.
+
+5. **Graduation path.** If built-in tools converge across providers (Google Search grounding + OpenAI web search + Anthropic web search all providing equivalent functionality with comparable output schemas), the converged capability becomes a graduation candidate from Layer 2 to Layer 1. The graduation criteria from ADR-006 apply: multi-provider convergence, normalizable semantics, and demonstrated consumer demand. As of this writing, convergence is occurring (OpenAI, Anthropic, and Google all offer web search), but output schemas remain too divergent for normalization.
+
+**Changes required:**
+- **OntologicalTaxonomy.md Section 1.1.3 (Capabilities):** Add a note distinguishing user-defined tool calling (Layer 1, Extended Tier 1) from vendor-provided built-in tools (Layer 2, extension). Reference the Augmented Generation species.
+- **OntologicalTaxonomy.md Section 6.5 (Local Runtime Concepts):** No change needed; local runtimes do not have vendor-provided built-in tools.
+
+**Residual risk:** Medium-term. The multi-vendor convergence of web search capabilities (OpenAI, Anthropic, Google all offering it) is creating pressure for graduation. If output schemas converge sufficiently, a `web_search` Layer 1 capability with normalized citation output would be warranted. This should be re-evaluated within 6 months.
+
 ---
 
 ## Summary: Priority-Ordered Revision Watchlist
 
-| Priority | Soft Spot | Likelihood | Severity | Seam Impact | First Thing That Breaks |
-|----------|-----------|------------|----------|-------------|------------------------|
-| 1 | **Content is not a string** | HIGH | CRITICAL | SEAM | Multimodal input, tool-call output, thinking blocks |
-| 2 | **Token accounting assumes simple arithmetic** | HIGH | HIGH | SEAM | Reasoning model cost prediction, validate_request accuracy |
-| 3 | **Tool calling deferred as monolith** | HIGH | HIGH | SEAM | Agentic workflows, the primary growth vector |
-| 4 | **Finish reasons collapse with info loss** | HIGH | MEDIUM | SEAM | Agentic control flow (stop vs. needs-tool-execution) |
-| 5 | **Streaming protocol treated as uniform** | MEDIUM | HIGH | NEAR-SEAM | Multi-block streaming (tool calls + text in same response) |
-| 6 | **Extension bag is load-bearing** | HIGH | MEDIUM | SEAM | Facade value proposition, normalization coverage |
-| 7 | **Reasoning classified as Tier 3** | HIGH | MEDIUM | NEAR-SEAM | Cost control, capability discovery for reasoning models |
-| 8 | **Local runtime model management absent** | MEDIUM | MEDIUM | NEAR-SEAM | Local deployment UX, model loading latency |
-| 9 | **Safety as fixed binary** | MEDIUM | MEDIUM | NEAR-SEAM | Gemini safety configuration, regulatory compliance |
-| 10 | **Structured output as single feature** | MEDIUM | MEDIUM | NEAR-SEAM | Output reliability guarantees, capability discovery |
-| 11 | **Sampling pipeline assumed fixed** | LOW | MEDIUM | BELOW-SEAM | Local runtime adapter correctness |
-| 12 | **Role alternation invisible** | MEDIUM | LOW | NEAR-SEAM | Anthropic message validation, validate_request accuracy |
-| 13 | **Vendor built-in tools uncategorized** | MEDIUM | LOW | BELOW-SEAM | Gemini Search/Code Execution enablement |
+| Priority | Soft Spot | Likelihood | Severity | Seam Impact | Resolution Status | Resolved By | Date |
+|----------|-----------|------------|----------|-------------|-------------------|-------------|------|
+| 1 | **Content is not a string** | HIGH | CRITICAL | SEAM | RESOLVED | ADR-003 | 2026-03-27 |
+| 2 | **Token accounting assumes simple arithmetic** | HIGH | HIGH | SEAM | PARTIALLY RESOLVED | ADR-004 + DomainModel | 2026-03-27 |
+| 3 | **Tool calling deferred as monolith** | HIGH | HIGH | SEAM | RESOLVED | ADR-005 + ToolCallingChoreography | 2026-03-27 |
+| 4 | **Finish reasons collapse with info loss** | HIGH | MEDIUM | SEAM | RESOLVED | TypeSpec FinishReason expansion | 2026-03-27 |
+| 5 | **Streaming protocol treated as uniform** | MEDIUM | HIGH | NEAR-SEAM | RESOLVED (gap: block_index) | TypeSpec + ToolCallingChoreography | 2026-03-27 |
+| 6 | **Extension bag is load-bearing** | HIGH | MEDIUM | SEAM | RESOLVED | ADR-006 + feature graduations | 2026-03-27 |
+| 7 | **Reasoning classified as Tier 3** | HIGH | MEDIUM | NEAR-SEAM | RESOLVED | ADR-004 | 2026-03-27 |
+| 8 | **Local runtime model management absent** | MEDIUM | MEDIUM | NEAR-SEAM | POSITION TAKEN | ModelReadiness + error split + extension | 2026-03-26 |
+| 9 | **Safety as fixed binary** | MEDIUM | MEDIUM | NEAR-SEAM | POSITION TAKEN | Layer 2 structured extension | 2026-03-27 |
+| 10 | **Structured output as single feature** | MEDIUM | MEDIUM | NEAR-SEAM | POSITION TAKEN | Layer 2 extension + tier model | 2026-03-27 |
+| 11 | **Sampling pipeline assumed fixed** | LOW | MEDIUM | BELOW-SEAM | POSITION TAKEN | Pedagogical clarification + Layer 2 extension | 2026-03-26 |
+| 12 | **Role alternation invisible** | MEDIUM | LOW | NEAR-SEAM | POSITION TAKEN | requires_alternation + adapter validation | 2026-03-26 |
+| 13 | **Vendor built-in tools uncategorized** | MEDIUM | LOW | BELOW-SEAM | POSITION TAKEN | built_in_tools Layer 2 extension | 2026-03-26 |
 
 ---
 
@@ -616,15 +845,21 @@ Some soft spots are not independent. They interact to create compound failure mo
 
 ### Compound Risk A: Content Blocks + Tool Calling + Streaming
 
-Soft Spots 1, 3, and 5 interact. If content becomes typed blocks, and tool-call output is a block type, then streaming must convey block identity. Fixing any one of these without the other two creates an inconsistent intermediate state. These three should be revised together as a single architectural change.
+**Status: RESOLVED.**
+
+Soft Spots 1, 3, and 5 were addressed together as recommended. ADR-003 (content blocks), ADR-005 (tool calling), and the TypeSpecification's CompletionChunk + ContentBlockDelta model were developed as a coordinated set. Content is now `ContentBlock[]` with ToolUseBlock/ToolResultBlock variants. Streaming carries typed `ContentBlockDelta` (TextDelta, ToolUseDelta, ThinkingDelta). The ToolCallingChoreography documents the complete streaming accumulation algorithm for each provider. One gap remains: `block_index` must be added to CompletionChunk to support interleaved multi-block streaming. This is a field addition, not an architectural change.
 
 ### Compound Risk B: Token Accounting + Reasoning + Extension Bag
 
-Soft Spots 2, 6, and 7 interact. If reasoning tokens are significant, they must be accounted for in `usage`. If reasoning configuration is in the extension bag, the facade cannot validate or predict reasoning token consumption. The facade's `validate_request` becomes unreliable for reasoning models.
+**Status: PARTIALLY RESOLVED.**
+
+Soft Spots 2, 6, and 7 were addressed together. ADR-004 brought reasoning into the facade (resolving Soft Spot 7). ADR-006 replaced the opaque extension bag with structured extensions (resolving Soft Spot 6). The remaining gap is that the `Usage` type does not carry `reasoning_tokens` separately (Soft Spot 2 residual). When reasoning token reporting converges across providers, this field should be added. The compound risk is no longer critical because reasoning is now a first-class facade concept with capability discovery and parameter normalization.
 
 ### Compound Risk C: Finish Reasons + Tool Calling + Agentic Loops
 
-Soft Spots 3 and 4 interact. Tool calling requires `tool_use` as a finish reason. Without both, the facade cannot represent the basic agentic loop: generate -> tool_use -> execute -> feed_result -> generate. This is not two separate features; it is one workflow that requires coordinated changes to tool schemas, finish reasons, message roles, and content types.
+**Status: RESOLVED.**
+
+Soft Spots 3 and 4 were addressed together. ADR-005 brought tool calling into the facade, including the `tool_use` finish reason and the `tool` role. The FinishReason enumeration was expanded to 5 values. The agentic loop (generate -> tool_use -> execute -> feed_result -> generate) is now fully representable in facade types. The ToolCallingChoreography documents the complete multi-turn flow.
 
 ---
 
@@ -632,10 +867,17 @@ Soft Spots 3 and 4 interact. Tool calling requires `tool_use` as a finish reason
 
 Based on compound risk analysis, the optimal revision order is:
 
-1. **Wave 1 (address together):** Content blocks + Tool calling + Finish reasons + Streaming typed deltas. These are architecturally coupled. Doing them piecemeal creates worse intermediate states than doing them together.
+1. **Wave 1 (address together):** Content blocks + Tool calling + Finish reasons + Streaming typed deltas. These are architecturally coupled. Doing them piecemeal creates worse intermediate states than doing them together. **STATUS: COMPLETE.** ADR-003, ADR-004, ADR-005, ADR-006, TypeSpecification, ToolCallingChoreography, and DomainModel all revised together.
 
-2. **Wave 2 (address together):** Reasoning tier reclassification + Token accounting expansion + Extension bag graduation criteria. These are operationally coupled.
+2. **Wave 2 (address together):** Reasoning tier reclassification + Token accounting expansion + Extension bag graduation criteria. These are operationally coupled. **STATUS: SUBSTANTIALLY COMPLETE.** ADR-004 and ADR-006 addressed the core issues. Residual: `reasoning_tokens` on Usage type.
 
-3. **Wave 3 (address independently):** Local runtime model management, safety configuration, structured output tiers, role alternation. These are independent and can be addressed as needed.
+3. **Wave 3 (address independently):** Local runtime model management, safety configuration, structured output tiers, role alternation. These are independent and can be addressed as needed. **STATUS: POSITIONS TAKEN.** Concrete positions documented for all four. Implementation deferred to when the changes are made to the TypeSpecification and DomainModel.
+
+**Remaining implementation work:**
+- Add `block_index` to CompletionChunk in TypeSpecification, DomainModel, and McpServerSpec.
+- Add `ModelReadiness` type and `model_not_found` / `model_not_ready` error codes to TypeSpecification and DomainModel.
+- Add `requires_alternation` to ModelCapabilities in TypeSpecification and DomainModel.
+- Add pedagogical clarification note to OntologicalTaxonomy Section 3.1.
+- Add `built_in_tools` and `sampling_advanced` extension descriptors to implementation guidance.
 
 This document should be revisited at minimum every 3 months, or immediately when a cross-validation run produces findings that contradict the taxonomy's Tier classifications.

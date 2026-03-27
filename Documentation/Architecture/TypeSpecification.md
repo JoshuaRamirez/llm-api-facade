@@ -181,6 +181,7 @@ CompletionResponse.
 |-------|------|----------|-------------|
 | `completion_id` | string | Yes | Stable across all chunks in one stream; identifies the generation |
 | `chunk_index` | non-negative integer | Yes | Position of this chunk in the stream, starting at 0 |
+| `block_index` | non-negative integer | Yes | Identifies which content block in the final response this delta belongs to (0-based). Required for multi-block streaming where text, tool-use, and thinking deltas interleave. |
 | `delta` | ContentBlockDelta | Yes | The incremental content in this chunk |
 | `finish_reason` | FinishReason? | Conditional | Present only on the final chunk; null on all preceding chunks |
 | `usage` | Usage? | Conditional | Present only on the final chunk; null on all preceding chunks |
@@ -365,6 +366,8 @@ particular model-provider pair can do at the time of query.
 | `supports_thinking` | boolean | Yes | Whether the model supports extended thinking / reasoning |
 | `supports_vision` | boolean | Yes | Whether the model accepts ImageBlock content in messages |
 | `supported_parameters` | ParameterSupport | Yes | Detailed support information for each optional generation parameter |
+| `requires_alternation` | boolean | Yes | Whether the model requires strict user/assistant role alternation in messages. When true, consecutive same-role messages are rejected by the provider. |
+| `model_readiness` | ModelReadiness | Yes | Current operational state of the model (always `available` for cloud providers) |
 | `available_extensions` | ExtensionDescriptor[] | Yes | Provider-specific features available for this model, with schemas. Empty array if none. |
 
 **Invariants:**
@@ -374,10 +377,30 @@ particular model-provider pair can do at the time of query.
 3. When `supports_system_message` is false, any system-role message in the request must be handled by the integration plane (merged into the first user message, or rejected -- this is an adapter concern).
 4. When `supports_tool_calling` is false, submitting tool definitions or tool-role messages is a validation error.
 5. Extension IDs within `available_extensions` must be unique. No two ExtensionDescriptor entries may share the same `id`.
+6. When `requires_alternation` is true, `validate_request` should check that messages alternate between user and assistant roles (after system message).
+7. When `model_readiness.state` is not `available`, the model cannot serve generation requests.
 
 ---
 
-### 3.3 ParameterSupport
+### 3.3 ModelReadiness
+
+Represents the current operational state of a model. Cloud providers always
+report `available`. Local runtimes expose the full lifecycle.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | One of: `available` (ready to serve), `loading` (being loaded into memory), `unloading` (being removed), `not_loaded` (exists but not in memory), `unavailable` (cannot be used) |
+| `estimated_ready_seconds` | integer? | No | Estimated seconds until model reaches `available` state. Present only when `state` is `loading`. Null otherwise. |
+
+**Invariants:**
+
+1. `estimated_ready_seconds` must be non-negative when present.
+2. `estimated_ready_seconds` is present only when `state` is `loading`.
+3. Cloud adapters always return `{ state: "available", estimated_ready_seconds: null }`.
+
+---
+
+### 3.4 ParameterSupport
 
 Describes which optional generation parameters a specific model accepts, and
 what value ranges are legal. This is a structured capability description, not
@@ -681,12 +704,15 @@ ErrorCategory
  |    |   The caller's identity is verified but lacks access.
  |    |   Examples: valid key without access to the requested model or feature.
  |    |
- |    +-- model_unavailable        Retryable: Conditional
- |         The target model does not exist or is not currently available.
- |         Examples: typo in model name, provider deregistered, model
- |         temporarily offline.
- |         Retryable when the model may come back online (transient);
- |         not retryable when the model does not exist (permanent).
+ |    +-- model_not_found           Retryable: No
+ |    |   The target model does not exist in the provider's registry.
+ |    |   Examples: typo in model name, model deregistered.
+ |    |
+ |    +-- model_not_ready           Retryable: Yes
+ |         The target model exists but is not currently available to
+ |         serve requests. Check model_readiness for state details.
+ |         Examples: model not loaded (local runtime), model loading,
+ |         model temporarily offline.
  |
  +-- CapacityFailure
  |    |
@@ -766,7 +792,7 @@ interface ICompletionProvider {
 
     resolve_model(model_id: string)
         -> (ModelIdentity, ModelCapabilities)
-         | FacadeError[model_unavailable]
+         | FacadeError[model_not_found / model_not_ready]
 
     complete(request: NormalizedRequest)
         -> CompletionResponse
@@ -790,7 +816,7 @@ interface ICompletionProvider {
 - Returns a valid ModelCapabilities reflecting the model's current capabilities.
 
 **Postconditions on failure:**
-- Returns a FacadeError with category `model_unavailable` if the model does not exist or is not currently available from this provider.
+- Returns a FacadeError with category `model_not_found / model_not_ready` if the model does not exist or is not currently available from this provider.
 
 #### Method: complete
 
@@ -946,7 +972,7 @@ Error transitions (any state may transition to Failed):
 | **Actions performed** | 1. Assign a unique correlation ID to the request. 2. Resolve the model identifier to a ModelIdentity via `ICompletionProvider.resolve_model`. 3. Validate all NormalizedRequest invariants (Section 4.5). 4. Validate message sequence grammar (roles in legal order). 5. Check that estimated input tokens + max_tokens does not exceed context_window. 6. Normalize parameters: apply bare-string content expansion, clamp out-of-range values with warnings, ignore unsupported parameters with warnings. |
 | **Data type produced** | NormalizedRequest (fully validated) |
 | **Invariants that must hold** | All NormalizedRequest invariants (Section 4.5) are satisfied. All Message invariants (Section 1.1) are satisfied. All GenerationParameters invariants (Section 4.1) are satisfied. |
-| **Failure mode** | Transition to Rejected with a FacadeError of category `validation_error`, `model_unavailable`, or `context_overflow`. |
+| **Failure mode** | Transition to Rejected with a FacadeError of category `validation_error`, `model_not_found / model_not_ready`, or `context_overflow`. |
 
 #### Transition: Created -> Rejected
 
