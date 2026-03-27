@@ -24,6 +24,8 @@ export type {
   ConstraintParameters,
   BehavioralParameters,
   MetaParameters,
+  StructuralParameters,
+  ToolDefinition,
 } from "./generation-parameters.js";
 export type { NormalizedRequest } from "./normalized-request.js";
 export type { CompletionProvider } from "./completion-provider.js";

@@ -26,9 +26,20 @@ export interface MetaParameters {
   readonly reasoningEffort?: ReasoningEffort | undefined;
 }
 
+export interface ToolDefinition {
+  readonly name: string;
+  readonly description?: string | undefined;
+  readonly parameters?: Record<string, unknown> | undefined;
+}
+
+export interface StructuralParameters {
+  readonly tools?: readonly ToolDefinition[] | undefined;
+}
+
 export interface GenerationParameters {
   readonly sampling?: SamplingParameters | undefined;
   readonly constraints?: ConstraintParameters | undefined;
   readonly behavioral?: BehavioralParameters | undefined;
   readonly meta?: MetaParameters | undefined;
+  readonly structural?: StructuralParameters | undefined;
 }

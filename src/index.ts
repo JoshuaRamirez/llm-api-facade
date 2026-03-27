@@ -65,6 +65,11 @@ server.tool(
     temperature: z.number().min(0).max(2).optional().describe("Sampling temperature"),
     top_p: z.number().min(0).max(1).optional().describe("Nucleus sampling threshold"),
     stop_sequences: z.array(z.string()).optional().describe("Stop sequences"),
+    tools: z.array(z.object({
+      name: z.string(),
+      description: z.string().optional(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
+    })).optional().describe("Tool definitions the model may invoke"),
   },
   async (params) => {
     try {
@@ -90,6 +95,13 @@ server.tool(
             maxTokens: params.max_tokens,
             stopSequences: params.stop_sequences,
           },
+          structural: params.tools ? {
+            tools: params.tools.map(t => ({
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters,
+            })),
+          } : undefined,
         },
       );
 

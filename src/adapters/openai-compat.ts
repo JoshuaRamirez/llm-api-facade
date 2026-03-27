@@ -308,6 +308,18 @@ export class OpenAICompatAdapter implements CompletionProvider {
     if (params.behavioral?.presencePenalty !== undefined) wire.presence_penalty = params.behavioral.presencePenalty;
     if (params.meta?.seed !== undefined) wire.seed = params.meta.seed;
 
+    // Structural: tools
+    if (params.structural?.tools && params.structural.tools.length > 0) {
+      wire.tools = params.structural.tools.map(t => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters ?? { type: "object", properties: {} },
+        },
+      }));
+    }
+
     return wire;
   }
 
