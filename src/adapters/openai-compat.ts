@@ -308,6 +308,22 @@ export class OpenAICompatAdapter implements CompletionProvider {
     if (params.behavioral?.presencePenalty !== undefined) wire.presence_penalty = params.behavioral.presencePenalty;
     if (params.meta?.seed !== undefined) wire.seed = params.meta.seed;
 
+    // Structural: response_format
+    if (params.structural?.responseFormat) {
+      const rf = params.structural.responseFormat;
+      if (rf.type === "json") {
+        wire.response_format = { type: "json_object" };
+      } else if (rf.type === "json_schema" && rf.schema) {
+        wire.response_format = {
+          type: "json_schema",
+          json_schema: {
+            name: rf.schemaName ?? "response",
+            schema: rf.schema,
+          },
+        };
+      }
+    }
+
     // Structural: tools
     if (params.structural?.tools && params.structural.tools.length > 0) {
       wire.tools = params.structural.tools.map(t => ({

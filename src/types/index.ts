@@ -26,6 +26,7 @@ export type {
   MetaParameters,
   StructuralParameters,
   ToolDefinition,
+  ResponseFormat,
 } from "./generation-parameters.js";
 export type { NormalizedRequest } from "./normalized-request.js";
 export type { CompletionProvider } from "./completion-provider.js";

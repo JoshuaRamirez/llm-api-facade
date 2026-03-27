@@ -32,8 +32,15 @@ export interface ToolDefinition {
   readonly parameters?: Record<string, unknown> | undefined;
 }
 
+export interface ResponseFormat {
+  readonly type: "text" | "json" | "json_schema";
+  readonly schema?: Record<string, unknown> | undefined;
+  readonly schemaName?: string | undefined;
+}
+
 export interface StructuralParameters {
   readonly tools?: readonly ToolDefinition[] | undefined;
+  readonly responseFormat?: ResponseFormat | undefined;
 }
 
 export interface GenerationParameters {

@@ -70,6 +70,11 @@ server.tool(
       description: z.string().optional(),
       parameters: z.record(z.string(), z.unknown()).optional(),
     })).optional().describe("Tool definitions the model may invoke"),
+    response_format: z.object({
+      type: z.enum(["text", "json", "json_schema"]),
+      schema: z.record(z.string(), z.unknown()).optional(),
+      schema_name: z.string().optional(),
+    }).optional().describe("Output format constraint"),
   },
   async (params) => {
     try {
@@ -95,12 +100,17 @@ server.tool(
             maxTokens: params.max_tokens,
             stopSequences: params.stop_sequences,
           },
-          structural: params.tools ? {
-            tools: params.tools.map(t => ({
+          structural: (params.tools || params.response_format) ? {
+            tools: params.tools?.map(t => ({
               name: t.name,
               description: t.description,
               parameters: t.parameters,
             })),
+            responseFormat: params.response_format ? {
+              type: params.response_format.type,
+              schema: params.response_format.schema,
+              schemaName: params.response_format.schema_name,
+            } : undefined,
           } : undefined,
         },
       );
