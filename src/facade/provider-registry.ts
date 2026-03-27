@@ -7,7 +7,7 @@ export class ProviderRegistry {
   private providers: Map<string, CompletionProvider> = new Map();
 
   register(provider: CompletionProvider): void {
-    console.log(`[registry] Registering provider: ${provider.providerId}`);
+    console.error(`[registry] Registering provider: ${provider.providerId}`);
     this.providers.set(provider.providerId, provider);
   }
 

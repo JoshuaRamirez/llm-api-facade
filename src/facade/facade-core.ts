@@ -15,66 +15,94 @@ export class FacadeCore {
 
   async complete(
     modelId: string,
-    messages: Message[],
+    messages: readonly Message[],
     parameters: GenerationParameters = {},
     extensions?: Record<string, unknown>,
   ): Promise<CompletionResponse> {
     const correlationId = generateCorrelationId();
-    console.log(`[facade] complete: model=${modelId} messages=${messages.length} correlationId=${correlationId}`);
+    console.error(`[facade] complete: model=${modelId} messages=${messages.length} correlationId=${correlationId}`);
 
-    // Validate: resolve model
     const resolved = await this.registry.resolveModel(modelId);
     if (!resolved) {
       throw new FacadeError(
         "precondition.model_not_found",
+        "MODEL_NOT_FOUND",
         `No model registered with identifier '${modelId}'`,
         correlationId,
         false,
       );
     }
 
-    // Validate: messages non-empty
+    // Check model readiness
+    if (resolved.capabilities.modelReadiness.state !== "available") {
+      throw new FacadeError(
+        "precondition.model_not_ready",
+        "MODEL_NOT_READY",
+        `Model '${modelId}' is ${resolved.capabilities.modelReadiness.state}`,
+        correlationId,
+        true,
+      );
+    }
+
     if (messages.length === 0) {
       throw new FacadeError(
         "precondition.validation_error",
+        "EMPTY_MESSAGES",
         "Messages array must contain at least one message",
         correlationId,
         false,
       );
     }
 
-    // Build NormalizedRequest
     const request: NormalizedRequest = {
       model: resolved.identity,
-      messages,
+      messages: Object.freeze([...messages]),
       parameters,
       stream: false,
       extensions,
     };
 
-    console.log(`[facade] dispatching to provider: ${resolved.provider.providerId}`);
-
-    // Dispatch to provider
+    console.error(`[facade] dispatching to provider: ${resolved.provider.providerId}`);
     const response = await resolved.provider.complete(request);
-
-    console.log(`[facade] complete: finishReason=${response.finishReason} tokens=${response.usage.inputTokens}+${response.usage.outputTokens}`);
+    console.error(`[facade] complete: finishReason=${response.finishReason} tokens=${response.usage.inputTokens}+${response.usage.outputTokens}`);
     return response;
   }
 
   async *completeStream(
     modelId: string,
-    messages: Message[],
+    messages: readonly Message[],
     parameters: GenerationParameters = {},
     extensions?: Record<string, unknown>,
   ): AsyncIterable<CompletionChunk> {
     const correlationId = generateCorrelationId();
-    console.log(`[facade] stream_complete: model=${modelId} messages=${messages.length} correlationId=${correlationId}`);
+    console.error(`[facade] stream_complete: model=${modelId} messages=${messages.length} correlationId=${correlationId}`);
 
     const resolved = await this.registry.resolveModel(modelId);
     if (!resolved) {
       throw new FacadeError(
         "precondition.model_not_found",
+        "MODEL_NOT_FOUND",
         `No model registered with identifier '${modelId}'`,
+        correlationId,
+        false,
+      );
+    }
+
+    if (resolved.capabilities.modelReadiness.state !== "available") {
+      throw new FacadeError(
+        "precondition.model_not_ready",
+        "MODEL_NOT_READY",
+        `Model '${modelId}' is ${resolved.capabilities.modelReadiness.state}`,
+        correlationId,
+        true,
+      );
+    }
+
+    if (!resolved.capabilities.supportsStreaming) {
+      throw new FacadeError(
+        "precondition.validation_error",
+        "STREAMING_NOT_SUPPORTED",
+        `Model '${modelId}' does not support streaming`,
         correlationId,
         false,
       );
@@ -83,6 +111,7 @@ export class FacadeCore {
     if (messages.length === 0) {
       throw new FacadeError(
         "precondition.validation_error",
+        "EMPTY_MESSAGES",
         "Messages array must contain at least one message",
         correlationId,
         false,
@@ -91,13 +120,13 @@ export class FacadeCore {
 
     const request: NormalizedRequest = {
       model: resolved.identity,
-      messages,
+      messages: Object.freeze([...messages]),
       parameters,
       stream: true,
       extensions,
     };
 
-    console.log(`[facade] dispatching stream to provider: ${resolved.provider.providerId}`);
+    console.error(`[facade] dispatching stream to provider: ${resolved.provider.providerId}`);
     yield* resolved.provider.completeStream(request);
   }
 }

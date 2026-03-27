@@ -8,7 +8,7 @@ import { type GenerationParameters } from "./generation-parameters.js";
  */
 export interface NormalizedRequest {
   readonly model: ModelIdentity;
-  readonly messages: Message[];
+  readonly messages: readonly Message[];
   readonly parameters: GenerationParameters;
   readonly stream: boolean;
   readonly extensions?: Readonly<Record<string, unknown>> | undefined;

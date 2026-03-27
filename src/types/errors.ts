@@ -1,5 +1,5 @@
 /**
- * Facade error hierarchy. 4 genera, 14 species.
+ * Facade error hierarchy. 4 genera, 15 species.
  * (TypeSpecification Section 5)
  */
 
@@ -22,12 +22,14 @@ export type ErrorCategory =
 
 export class FacadeError extends Error {
   readonly category: ErrorCategory;
+  readonly code: string;
   readonly retryable: boolean;
   readonly correlationId: string;
-  readonly providerCode?: string | undefined;
+  readonly providerCode: string | undefined;
 
   constructor(
     category: ErrorCategory,
+    code: string,
     message: string,
     correlationId: string,
     retryable: boolean,
@@ -36,6 +38,7 @@ export class FacadeError extends Error {
     super(message);
     this.name = "FacadeError";
     this.category = category;
+    this.code = code;
     this.retryable = retryable;
     this.correlationId = correlationId;
     this.providerCode = providerCode;

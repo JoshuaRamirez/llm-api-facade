@@ -4,14 +4,12 @@ import { z } from "zod/v4";
 import { ProviderRegistry } from "./facade/provider-registry.js";
 import { FacadeCore } from "./facade/facade-core.js";
 import { OpenAICompatAdapter } from "./adapters/openai-compat.js";
-import { createMessage, FacadeError } from "./types/index.js";
-import { type ContentBlock } from "./types/content-block.js";
+import { createMessage, FacadeError, type ContentBlock } from "./types/index.js";
 
 // --- Bootstrap ---
 
 const registry = new ProviderRegistry();
 
-// Register Ollama as default provider (local, no auth)
 registry.register(new OpenAICompatAdapter({
   providerId: "ollama",
   baseUrl: "http://localhost:11434",
@@ -61,7 +59,6 @@ server.tool(
         },
       );
 
-      // Serialize content blocks to readable format
       return {
         content: [
           {
@@ -86,7 +83,12 @@ server.tool(
           content: [{
             type: "text" as const,
             text: JSON.stringify({
-              error: { code: err.category, message: err.message, retryable: err.retryable },
+              error: {
+                code: err.code,
+                category: err.category,
+                message: err.message,
+                retryable: err.retryable,
+              },
             }),
           }],
           isError: true,
@@ -119,13 +121,13 @@ server.tool(
 // --- Start ---
 
 async function main(): Promise<void> {
-  console.log("[mcp] llm-api-facade starting...");
-  console.log(`[mcp] providers: ${registry.listProviders().join(", ")}`);
+  console.error("[mcp] llm-api-facade starting...");
+  console.error(`[mcp] providers: ${registry.listProviders().join(", ")}`);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.log("[mcp] connected via stdio");
+  console.error("[mcp] connected via stdio");
 }
 
 main().catch(err => {

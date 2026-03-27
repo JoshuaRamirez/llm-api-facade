@@ -39,14 +39,13 @@ export class OpenAICompatAdapter implements CompletionProvider {
   }
 
   async resolveModel(modelId: string): Promise<{ identity: ModelIdentity; capabilities: ModelCapabilities } | null> {
-    // Query the provider's model list to check availability
     try {
       const response = await fetch(`${this.baseUrl}/v1/models`, {
         headers: this.buildHeaders(),
       });
 
       if (!response.ok) {
-        console.log(`[${this.providerId}] models endpoint returned ${response.status}`);
+        console.error(`[${this.providerId}] models endpoint returned ${response.status}`);
         return null;
       }
 
@@ -54,7 +53,6 @@ export class OpenAICompatAdapter implements CompletionProvider {
       const model = data.data.find(m => m.id === modelId);
 
       if (!model) {
-        // Try with default model
         if (this.defaultModel && modelId === this.defaultModel) {
           return this.buildModelResult(modelId);
         }
@@ -62,16 +60,17 @@ export class OpenAICompatAdapter implements CompletionProvider {
       }
 
       return this.buildModelResult(modelId);
-    } catch (err) {
-      console.log(`[${this.providerId}] resolveModel error: ${err}`);
-      // Fallback: assume the model exists if we can't query
-      return this.buildModelResult(modelId);
+    } catch (_err) {
+      // Network failure: model is not resolvable at this time.
+      // Do NOT fabricate capabilities — return null so the facade reports model_not_found.
+      console.error(`[${this.providerId}] resolveModel: provider unreachable`);
+      return null;
     }
   }
 
   async complete(request: NormalizedRequest): Promise<CompletionResponse> {
     const wireRequest = this.translateRequest(request);
-    console.log(`[${this.providerId}] POST /v1/chat/completions model=${wireRequest.model}`);
+    console.error(`[${this.providerId}] POST /v1/chat/completions model=${wireRequest.model as string}`);
 
     const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -81,7 +80,7 @@ export class OpenAICompatAdapter implements CompletionProvider {
 
     if (!response.ok) {
       const errorBody = await response.text();
-      console.log(`[${this.providerId}] error ${response.status}: ${errorBody}`);
+      console.error(`[${this.providerId}] error ${response.status}`);
       throw this.translateError(response.status, errorBody, request.model.modelId);
     }
 
@@ -104,11 +103,13 @@ export class OpenAICompatAdapter implements CompletionProvider {
     }
 
     if (!response.body) {
-      throw new FacadeError("system.provider_error", "No response body for stream", "stream", true);
+      throw new FacadeError("system.provider_error", "NO_STREAM_BODY", "No response body for stream", "stream", true);
     }
 
     const completionId = `cpl_${Date.now().toString(36)}`;
     let chunkIndex = 0;
+    let outputTokenEstimate = 0;
+    let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -129,32 +130,68 @@ export class OpenAICompatAdapter implements CompletionProvider {
           const payload = trimmed.slice(6);
           if (payload === "[DONE]") return;
 
-          const chunk = JSON.parse(payload) as OpenAIStreamChunk;
+          let chunk: OpenAIStreamChunk;
+          try {
+            chunk = JSON.parse(payload) as OpenAIStreamChunk;
+          } catch {
+            throw new FacadeError(
+              "process.stream_interrupted",
+              "MALFORMED_STREAM_CHUNK",
+              "Failed to parse streaming chunk as JSON",
+              completionId,
+              true,
+            );
+          }
+
           const choice = chunk.choices[0];
           if (!choice) continue;
+
+          if (chunk.usage) {
+            lastUsage = chunk.usage;
+          }
 
           const delta = choice.delta;
           const finishReason = choice.finish_reason ? this.mapFinishReason(choice.finish_reason) : undefined;
 
+          // Tool call deltas
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              yield {
+                completionId,
+                chunkIndex: chunkIndex++,
+                blockIndex: tc.index + 1, // block 0 is text, tool calls start at 1
+                delta: {
+                  type: "tool_use_delta" as const,
+                  toolUseId: tc.id,
+                  name: tc.function?.name,
+                  inputJsonDelta: tc.function?.arguments ?? "",
+                },
+                finishReason,
+              };
+            }
+          }
+
           // Text content delta
           if (delta.content !== null && delta.content !== undefined) {
+            outputTokenEstimate++;
             yield {
               completionId,
               chunkIndex: chunkIndex++,
               blockIndex: 0,
               delta: { type: "text_delta" as const, text: delta.content },
               finishReason,
-              usage: chunk.usage ? createUsage(chunk.usage.prompt_tokens, chunk.usage.completion_tokens, false) : undefined,
             };
-          } else if (finishReason) {
-            // Final chunk with no content
+          } else if (finishReason && !delta.tool_calls) {
+            // Final chunk — ensure usage is present per invariant
             yield {
               completionId,
               chunkIndex: chunkIndex++,
               blockIndex: 0,
               delta: { type: "text_delta" as const, text: "" },
               finishReason,
-              usage: chunk.usage ? createUsage(chunk.usage.prompt_tokens, chunk.usage.completion_tokens, false) : undefined,
+              usage: lastUsage
+                ? createUsage(lastUsage.prompt_tokens, lastUsage.completion_tokens, false)
+                : createUsage(0, outputTokenEstimate, true),
             };
           }
         }
@@ -167,11 +204,48 @@ export class OpenAICompatAdapter implements CompletionProvider {
   // --- Translation: Facade → Wire ---
 
   private translateRequest(request: NormalizedRequest): Record<string, unknown> {
-    const messages = request.messages.map(msg => ({
-      role: msg.role,
-      content: this.contentToWire(msg.content),
-      ...(msg.toolCallId ? { tool_call_id: msg.toolCallId } : {}),
-    }));
+    const messages: Record<string, unknown>[] = [];
+
+    for (const msg of request.messages) {
+      if (msg.role === "tool") {
+        // Facade tool-role message → OpenAI tool message with tool_call_id
+        messages.push({
+          role: "tool",
+          tool_call_id: msg.toolCallId,
+          content: this.contentToWireString(msg.content),
+        });
+      } else if (msg.role === "assistant" && this.hasToolUseBlocks(msg.content)) {
+        // Assistant message with ToolUseBlocks → OpenAI assistant with tool_calls field
+        const textParts: string[] = [];
+        const toolCalls: Array<{ id: string; type: string; function: { name: string; arguments: string } }> = [];
+
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            textParts.push(block.text);
+          } else if (block.type === "tool_use") {
+            toolCalls.push({
+              id: block.toolUseId,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input),
+              },
+            });
+          }
+        }
+
+        messages.push({
+          role: "assistant",
+          content: textParts.join("") || null,
+          tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+        });
+      } else {
+        messages.push({
+          role: msg.role,
+          content: this.contentToWire(msg.content),
+        });
+      }
+    }
 
     const wire: Record<string, unknown> = {
       model: request.model.modelId,
@@ -191,7 +265,6 @@ export class OpenAICompatAdapter implements CompletionProvider {
   }
 
   private contentToWire(content: readonly ContentBlock[]): string | unknown[] {
-    // Optimization: if content is a single TextBlock, send as string
     if (content.length === 1 && content[0]!.type === "text") {
       return content[0]!.text;
     }
@@ -204,9 +277,21 @@ export class OpenAICompatAdapter implements CompletionProvider {
             ? { url: `data:${block.mediaType};base64,${block.data}` }
             : { url: block.sourceUrl },
         };
-        default: return { type: "text", text: `[${block.type} block]` };
+        case "thinking": return { type: "text", text: block.thinking };
+        case "tool_use": return { type: "text", text: `[tool_use: ${block.name}]` };
+        case "tool_result": return { type: "text", text: this.contentToWireString(block.content) };
       }
     });
+  }
+
+  private contentToWireString(content: readonly ContentBlock[]): string {
+    return content
+      .map(b => b.type === "text" ? b.text : `[${b.type}]`)
+      .join("");
+  }
+
+  private hasToolUseBlocks(content: readonly ContentBlock[]): boolean {
+    return content.some(b => b.type === "tool_use");
   }
 
   // --- Translation: Wire → Facade ---
@@ -214,24 +299,28 @@ export class OpenAICompatAdapter implements CompletionProvider {
   private translateResponse(data: OpenAIChatCompletion): CompletionResponse {
     const choice = data.choices[0];
     if (!choice) {
-      throw new FacadeError("system.provider_error", "No choices in response", "translate", true);
+      throw new FacadeError("system.provider_error", "NO_CHOICES", "No choices in response", "translate", true);
     }
 
     const content: ContentBlock[] = [];
 
-    // Text content
     if (choice.message.content) {
       content.push({ type: "text", text: choice.message.content });
     }
 
-    // Tool calls → ToolUseBlock
     if (choice.message.tool_calls) {
       for (const tc of choice.message.tool_calls) {
+        let parsedInput: Record<string, unknown>;
+        try {
+          parsedInput = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+        } catch {
+          parsedInput = { _raw: tc.function.arguments };
+        }
         content.push({
           type: "tool_use",
           toolUseId: tc.id,
           name: tc.function.name,
-          input: JSON.parse(tc.function.arguments),
+          input: parsedInput,
         });
       }
     }
@@ -261,7 +350,7 @@ export class OpenAICompatAdapter implements CompletionProvider {
       case "length": return FinishReason.Length;
       case "content_filter": return FinishReason.ContentFilter;
       case "tool_calls": return FinishReason.ToolUse;
-      case "tool": return FinishReason.ToolUse; // llama.cpp uses "tool" singular
+      case "tool": return FinishReason.ToolUse;
       default: return FinishReason.Stop;
     }
   }
@@ -269,13 +358,13 @@ export class OpenAICompatAdapter implements CompletionProvider {
   private translateError(status: number, body: string, modelId: string): FacadeError {
     const correlationId = `err_${Date.now().toString(36)}`;
     switch (status) {
-      case 400: return new FacadeError("precondition.validation_error", body, correlationId, false);
-      case 401: return new FacadeError("precondition.authentication", "Invalid credentials", correlationId, false);
-      case 403: return new FacadeError("precondition.permission", "Insufficient access", correlationId, false);
-      case 404: return new FacadeError("precondition.model_not_found", `Model '${modelId}' not found`, correlationId, false);
-      case 429: return new FacadeError("capacity.rate_limited", "Rate limited", correlationId, true);
-      case 503: return new FacadeError("capacity.overloaded", "Service overloaded", correlationId, true);
-      default: return new FacadeError("system.provider_error", `HTTP ${status}: ${body}`, correlationId, true);
+      case 400: return new FacadeError("precondition.validation_error", "INVALID_PARAMS", body, correlationId, false);
+      case 401: return new FacadeError("precondition.authentication", "AUTH_FAILED", "Invalid credentials", correlationId, false);
+      case 403: return new FacadeError("precondition.permission", "PERMISSION_DENIED", "Insufficient access", correlationId, false);
+      case 404: return new FacadeError("precondition.model_not_found", "MODEL_NOT_FOUND", `Model '${modelId}' not found`, correlationId, false);
+      case 429: return new FacadeError("capacity.rate_limited", "RATE_LIMITED", "Rate limited", correlationId, true);
+      case 503: return new FacadeError("capacity.overloaded", "OVERLOADED", "Service overloaded", correlationId, true);
+      default: return new FacadeError("system.provider_error", "PROVIDER_ERROR", `HTTP ${status}`, correlationId, true);
     }
   }
 
@@ -295,7 +384,7 @@ export class OpenAICompatAdapter implements CompletionProvider {
         maxOutputTokens: 4096,
         supportsStreaming: true,
         supportsSystemMessage: true,
-        supportsToolCalling: false, // conservative default
+        supportsToolCalling: false,
         supportsThinking: false,
         supportsVision: false,
         requiresAlternation: false,
@@ -315,7 +404,7 @@ export class OpenAICompatAdapter implements CompletionProvider {
   }
 }
 
-// --- OpenAI Wire Types (subset needed for translation) ---
+// --- OpenAI Wire Types ---
 
 interface OpenAIChatCompletion {
   id: string;
@@ -343,6 +432,12 @@ interface OpenAIStreamChunk {
     delta: {
       role?: string;
       content?: string | null;
+      tool_calls?: Array<{
+        index: number;
+        id?: string;
+        type?: string;
+        function?: { name?: string; arguments?: string };
+      }>;
     };
     finish_reason: string | null;
   }>;

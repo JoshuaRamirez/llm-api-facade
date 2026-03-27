@@ -14,13 +14,12 @@ export interface ToolUseDelta {
   readonly type: "tool_use_delta";
   readonly toolUseId?: string | undefined;
   readonly name?: string | undefined;
-  readonly inputFragment?: string | undefined;
+  readonly inputJsonDelta: string;
 }
 
 export interface ThinkingDelta {
   readonly type: "thinking_delta";
-  readonly thinking?: string | undefined;
-  readonly signature?: string | undefined;
+  readonly thinking: string;
 }
 
 export type ContentBlockDelta = TextDelta | ToolUseDelta | ThinkingDelta;
