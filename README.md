@@ -56,6 +56,7 @@ llm-api-facade/
       SoftSpots.md               # 13 weak points, compound risks, revision waves
       ToolCallingChoreography.md # Multi-turn tool flows, provider divergence (1137 lines)
       PositionPaper-*.md         # Facade as information architecture (dual-layer ontology)
+      ExtensionCatalog.md        # 5 concrete extensions with schemas and adapter tables
     Decisions/
       ADR-Template.md            # Lightweight ADR template
       ADR-001-*.md               # MCP as primary interface

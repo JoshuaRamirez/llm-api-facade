@@ -37,6 +37,7 @@ Documentation and architectural design. No implementation code yet.
 - `Documentation/Architecture/SoftSpots.md` — 13 identified weak points in the conceptual model, prioritized by likelihood/severity/seam-impact, with compound risk analysis and revision wave sequencing
 - `Documentation/Architecture/ToolCallingChoreography.md` — multi-turn tool calling flows through the facade, provider divergence map (7 dimensions × 8 providers), role translation, streaming accumulation, thinking interaction, adapter implementor checklist (1137 lines)
 - `Documentation/Architecture/PositionPaper-FacadeAsInformationArchitecture.md` — the facade organizes the entire LLM interaction space (universal + provider-specific), not just normalizes. The seam is a lens, not a wall. Dual-layer ontology.
+- `Documentation/Architecture/ExtensionCatalog.md` — 5 concrete Layer 2 extensions with full schemas, adapter translation tables, guarantee-level matrices, and graduation likelihood
 
 ### Vendor Inventories (authoritative reference)
 - `Documentation/Vendors/OpenAI.md` — 581 lines. Every parameter, role, content block, error, model. Boundary-classified.
