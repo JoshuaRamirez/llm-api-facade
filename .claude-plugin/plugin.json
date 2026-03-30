@@ -1,0 +1,13 @@
+{
+  "name": "llm-api-facade",
+  "version": "0.1.0",
+  "description": "Universal LLM facade MCP server - dual-layer information architecture abstracting any LLM backend (local or cloud) with typed extensions",
+  "mcpServers": {
+    "llm-api-facade": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.js"]
+    }
+  },
+  "hooks": {},
+  "postInstall": "npm install && npm run build"
+}
