@@ -29,10 +29,20 @@ function wireBlockToFacade(block: Record<string, unknown>): ContentBlock {
 
 const registry = new ProviderRegistry();
 
+// Auto-register providers based on available configuration
 registry.register(new OpenAICompatAdapter({
   providerId: "ollama",
   baseUrl: "http://localhost:11434",
 }));
+
+if (process.env.OPENAI_API_KEY) {
+  registry.register(new OpenAICompatAdapter({
+    providerId: "openai",
+    baseUrl: "https://api.openai.com",
+    apiKey: process.env.OPENAI_API_KEY,
+  }));
+  console.error("[mcp] OpenAI provider registered");
+}
 
 const facade = new FacadeCore(registry);
 const server = new McpServer({

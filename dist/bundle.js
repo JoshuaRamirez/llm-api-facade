@@ -30739,6 +30739,14 @@ registry2.register(new OpenAICompatAdapter({
   providerId: "ollama",
   baseUrl: "http://localhost:11434"
 }));
+if (process.env.OPENAI_API_KEY) {
+  registry2.register(new OpenAICompatAdapter({
+    providerId: "openai",
+    baseUrl: "https://api.openai.com",
+    apiKey: process.env.OPENAI_API_KEY
+  }));
+  console.error("[mcp] OpenAI provider registered");
+}
 var facade = new FacadeCore(registry2);
 var server = new McpServer({
   name: "llm-api-facade",
