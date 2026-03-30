@@ -23,7 +23,7 @@ An MCP server providing a universal abstraction layer for any LLM backend (local
 
 ## Project Phase
 
-Documentation and architectural design. No implementation code yet.
+Phase 2: Implementation. TypeScript MCP server with OpenAI-compatible adapter, tested against Ollama (32 scenarios verified). Conceptual model complete (Phase 1).
 
 ## Documentation
 

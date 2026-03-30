@@ -2,78 +2,96 @@
 
 An MCP server that provides a universal abstraction layer for interacting with any LLM backend -- local or cloud -- through a single, stable interface.
 
-## Core Idea
+## What It Does
 
-One MCP server surface. Any LLM behind it. The consumer sends a generation request using a normalized vocabulary. The facade routes it to whichever backend is configured, translating parameters and response shapes as needed. The consumer never encounters provider-specific concepts.
+One MCP server surface. Any LLM behind it. The consumer sends a generation request using a normalized vocabulary. The facade routes it to whichever backend is configured, translating parameters and response shapes as needed.
 
-## What This Is Not
+The architecture has two layers:
+- **Layer 1 (Universal):** Normalized types, provider-agnostic. Messages, content blocks, token usage, generation parameters, error taxonomy. Works without knowing which provider serves the request.
+- **Layer 2 (Extensions):** Structured, typed, discoverable provider-specific features. Cache control, safety settings, reasoning configuration, structured output guarantees, token breakdowns.
 
-This project deliberately excludes:
+## Quick Start
 
-- **Provider-specific features** -- If only one provider offers it, it does not belong on the facade surface.
-- **Authentication management** -- Credential storage, rotation, and OAuth flows are integration-plane concerns.
-- **Cost tracking and billing** -- Token costs vary by provider and pricing tier. The facade reports token counts; cost accounting happens elsewhere.
-- **Conversation state ownership** -- The facade processes requests. It does not own or persist conversation history.
-- **Model fine-tuning or training** -- Inference only.
+```bash
+npm install
+npm run build
+```
 
-These are real concerns. They belong in the integration plane, not the abstraction layer.
+The server communicates via stdio. Add it to your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "llm-facade": {
+      "command": "node",
+      "args": ["/path/to/llm-api-facade/dist/index.js"]
+    }
+  }
+}
+```
+
+Requires [Ollama](https://ollama.com) running locally on the default port (11434).
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `complete` | Send messages to any LLM, receive a completion. Supports tools, structured output, all sampling parameters. |
+| `stream_complete` | Streaming variant. Returns accumulated chunks with usage. |
+| `list_models` | List configured providers. |
 
 ## The Seam
 
-The architecture enforces a clean boundary -- the **seam** -- between two distinct zones:
+The architecture enforces a clean boundary -- the **seam** -- between two zones:
 
 ```
   Consumer Side          |  THE SEAM  |          Provider Side
-                         |            |
-  Universal vocabulary   |            |   Provider-specific SDKs
-  Normalized parameters  |            |   Native API formats
-  Typed error categories |            |   Raw error responses
-  Capability discovery   |            |   Feature negotiation
+
+  Layer 1: Universal     | Normalizes |  Provider-specific SDKs
+  Layer 2: Extensions    | Organizes  |  Native API formats
+  Typed errors           |            |  Raw error responses
+  Capability discovery   |            |  Feature negotiation
 ```
 
-Nothing provider-specific crosses the seam into the consumer-facing surface. Nothing consumer-facing leaks into provider adapters. The seam is a load-bearing architectural boundary, not a convenience.
+Layer 1 normalizes (many shapes into one). Layer 2 organizes (provider-specific features into typed, discoverable extensions). Infrastructure concerns (auth, retry, transport) never cross the seam.
 
-## Project Status
+## Current State
 
-**Phase: Initial documentation and architectural design.**
+**Implemented and tested (32 scenarios against Ollama):**
+- Text completion (batch and streaming)
+- All sampling parameters (temperature, top_p, frequency/presence penalty, seed, stop sequences)
+- Tool calling (single-turn, multi-turn with results, multiple tools, correct tool selection)
+- Structured output (JSON mode, JSON Schema with constrained output)
+- Content block model (TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock, ImageBlock)
+- Error taxonomy (4 genera, 14 species)
+- OpenAI-compatible adapter (Ollama, OpenAI, vLLM, LM Studio, llama.cpp, Mistral, xAI)
 
-No implementation code exists yet. The current focus is establishing principles, boundaries, and contracts before writing adapters.
+**Documented but not yet implemented:**
+- Anthropic, Gemini, Cohere adapters
+- Extension system (cache_control, safety_settings, reasoning_config, structured_output, token_details)
+- MCP resources (models://catalog, config://state, session://{id})
+- validate_request, estimate_tokens, get_model_info tools
 
-## Directory Structure
+## Documentation
 
 ```
-llm-api-facade/
-  README.md
-  CLAUDE.md
-  Documentation/
-    Architecture/
-      Principles.md            # 7 governing architectural principles
-      DomainModel.md            # Universal concepts, behavioral contracts, the seam
-      McpServerSpec.md           # MCP tools, resources, schemas, error codes
-      ProviderAnalysis.md        # Cross-provider commonality analysis (11 providers)
-      OntologicalTaxonomy.md     # Categorical framework, cross-validated (843 lines)
-      TypeSpecification.md       # Formal types, invariants, state machine (1160 lines)
-      SoftSpots.md               # 13 weak points, compound risks, revision waves
-      ToolCallingChoreography.md # Multi-turn tool flows, provider divergence (1137 lines)
-      PositionPaper-*.md         # Facade as information architecture (dual-layer ontology)
-      ExtensionCatalog.md        # 5 concrete extensions with schemas and adapter tables
-    Decisions/
-      ADR-Template.md            # Lightweight ADR template
-      ADR-001-*.md               # MCP as primary interface
-      ADR-002-*.md               # Seam pattern for integration
-      ADR-003-*.md               # Content blocks replace string
-      ADR-004-*.md               # Thinking promoted to Extended Tier 2
-      ADR-005-*.md               # Tool calling promoted to Extended Tier 1
-      ADR-006-*.md               # Structured extensions replace opaque bag
-    Vendors/
-      OpenAI.md                  # Full API surface inventory (581 lines)
-      Anthropic.md               # Full API surface inventory (702 lines)
-      Google-Gemini.md           # Full API surface inventory (634 lines)
-      Mistral-Cohere-xAI.md     # Three providers combined (811 lines)
-      Local-Runtimes.md          # Ollama, llama.cpp, vLLM, LM Studio, TGW (1134 lines)
-    Guides/
+Documentation/
+  Architecture/
+    Principles.md              # 8 governing principles (dual-layer)
+    DomainModel.md              # Universal concepts, behavioral contracts, the seam
+    McpServerSpec.md             # MCP tools, resources, schemas, error codes (v0.3.0)
+    OntologicalTaxonomy.md       # Categorical framework, cross-validated
+    TypeSpecification.md         # Formal types, 48+ invariants, state machine
+    SoftSpots.md                 # 13 resolved weak points with positions taken
+    ToolCallingChoreography.md   # Multi-turn tool flows, 7-dimension provider divergence
+    PositionPaper-*.md           # Facade as information architecture
+    ExtensionCatalog.md          # 5 extensions with schemas and adapter tables
+  Decisions/
+    ADR-001 through ADR-007      # Architecture decision records
+  Vendors/
+    OpenAI, Anthropic, Gemini, Mistral/Cohere/xAI, Local Runtimes
 ```
 
 ## License
 
-TBD
+MIT
