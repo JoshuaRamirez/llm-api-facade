@@ -4,6 +4,7 @@ import { z } from "zod/v4";
 import { ProviderRegistry } from "./facade/provider-registry.js";
 import { FacadeCore } from "./facade/facade-core.js";
 import { OpenAICompatAdapter } from "./adapters/openai-compat.js";
+import { AnthropicAdapter } from "./adapters/anthropic.js";
 import { createMessage, FacadeError, type ContentBlock } from "./types/index.js";
 
 // --- Wire format → Facade type mapping (snake_case → camelCase) ---
@@ -42,6 +43,13 @@ if (process.env.OPENAI_API_KEY) {
     apiKey: process.env.OPENAI_API_KEY,
   }));
   console.error("[mcp] OpenAI provider registered");
+}
+
+if (process.env.ANTHROPIC_API_KEY) {
+  registry.register(new AnthropicAdapter({
+    apiKey: process.env.ANTHROPIC_API_KEY,
+  }));
+  console.error("[mcp] Anthropic provider registered");
 }
 
 const facade = new FacadeCore(registry);

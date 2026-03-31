@@ -30717,6 +30717,375 @@ var OpenAICompatAdapter = class {
   }
 };
 
+// dist/adapters/anthropic.js
+var AnthropicAdapter = class {
+  providerId = "anthropic";
+  apiKey;
+  apiVersion;
+  constructor(config2) {
+    this.apiKey = config2.apiKey;
+    this.apiVersion = config2.apiVersion ?? "2023-06-01";
+  }
+  async resolveModel(modelId) {
+    const knownPrefixes = ["claude-opus", "claude-sonnet", "claude-haiku", "claude-3", "claude-4"];
+    if (!knownPrefixes.some((p) => modelId.startsWith(p))) {
+      return null;
+    }
+    return {
+      identity: createModelIdentity(this.providerId, modelId),
+      capabilities: {
+        contextWindow: 2e5,
+        maxOutputTokens: 8192,
+        supportsStreaming: true,
+        supportsSystemMessage: true,
+        supportsToolCalling: true,
+        supportsThinking: true,
+        supportsVision: true,
+        requiresAlternation: true,
+        modelReadiness: { state: "available" },
+        supportedParameters: {
+          temperature: { supported: true, min: 0, max: 1, default: 1 },
+          topP: { supported: true, min: 0, max: 1 },
+          topK: { supported: true, min: 1 },
+          frequencyPenalty: { supported: false },
+          presencePenalty: { supported: false },
+          seed: { supported: false },
+          stopSequences: { supported: true }
+        },
+        availableExtensions: []
+      }
+    };
+  }
+  async complete(request) {
+    const wireRequest = this.translateRequest(request);
+    console.error(`[anthropic] POST /v1/messages model=${wireRequest.model}`);
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: this.buildHeaders(),
+      body: JSON.stringify(wireRequest)
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`[anthropic] error ${response.status}`);
+      throw this.translateError(response.status, errorBody);
+    }
+    const data = await response.json();
+    return this.translateResponse(data);
+  }
+  async *completeStream(request) {
+    const wireRequest = { ...this.translateRequest(request), stream: true };
+    const correlationId = `str_${Date.now().toString(36)}`;
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: this.buildHeaders(),
+      body: JSON.stringify(wireRequest)
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw this.translateError(response.status, errorBody);
+    }
+    if (!response.body) {
+      throw new FacadeError("system.provider_error", "NO_STREAM_BODY", "No response body for stream", correlationId, true);
+    }
+    let completionId = `cpl_${Date.now().toString(36)}`;
+    let chunkIndex = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let finishReason;
+    let usageEmitted = false;
+    const toolInputAccumulators = /* @__PURE__ */ new Map();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("event: "))
+            continue;
+          if (!trimmed.startsWith("data: "))
+            continue;
+          const payload = trimmed.slice(6);
+          let event;
+          try {
+            event = JSON.parse(payload);
+          } catch {
+            throw new FacadeError("process.stream_interrupted", "MALFORMED_STREAM_CHUNK", "Failed to parse Anthropic SSE event", correlationId, true);
+          }
+          switch (event.type) {
+            case "message_start": {
+              const msg = event.message;
+              completionId = msg.id;
+              inputTokens = msg.usage?.input_tokens ?? 0;
+              break;
+            }
+            case "content_block_start": {
+              const e = event;
+              const block = e.content_block;
+              if (block.type === "text") {
+              } else if (block.type === "tool_use") {
+                toolInputAccumulators.set(e.index, "");
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: e.index,
+                  delta: {
+                    type: "tool_use_delta",
+                    toolUseId: block.id,
+                    name: block.name,
+                    inputJsonDelta: ""
+                  }
+                };
+              } else if (block.type === "thinking") {
+              }
+              break;
+            }
+            case "content_block_delta": {
+              const e = event;
+              if (e.delta.type === "text_delta") {
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: e.index,
+                  delta: { type: "text_delta", text: e.delta.text }
+                };
+              } else if (e.delta.type === "input_json_delta") {
+                const accum = toolInputAccumulators.get(e.index) ?? "";
+                toolInputAccumulators.set(e.index, accum + e.delta.partial_json);
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: e.index,
+                  delta: {
+                    type: "tool_use_delta",
+                    inputJsonDelta: e.delta.partial_json
+                  }
+                };
+              } else if (e.delta.type === "thinking_delta") {
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: e.index,
+                  delta: { type: "thinking_delta", thinking: e.delta.thinking }
+                };
+              }
+              break;
+            }
+            case "content_block_stop":
+              break;
+            case "message_delta": {
+              const e = event;
+              finishReason = this.mapStopReason(e.delta.stop_reason);
+              outputTokens = e.usage?.output_tokens ?? outputTokens;
+              break;
+            }
+            case "message_stop": {
+              if (!usageEmitted) {
+                usageEmitted = true;
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: 0,
+                  delta: { type: "text_delta", text: "" },
+                  finishReason: finishReason ?? FinishReason.Stop,
+                  usage: createUsage(inputTokens, outputTokens, false)
+                };
+              }
+              break;
+            }
+            case "ping":
+            case "error":
+              if (event.type === "error") {
+                const err = event;
+                throw new FacadeError("process.stream_interrupted", "STREAM_ERROR", `Anthropic stream error: ${err.error?.message ?? "unknown"}`, correlationId, true);
+              }
+              break;
+          }
+        }
+      }
+      if (buffer.trim() && buffer.trim().startsWith("data: ")) {
+      }
+      if (!usageEmitted && chunkIndex > 0) {
+        yield {
+          completionId,
+          chunkIndex,
+          blockIndex: 0,
+          delta: { type: "text_delta", text: "" },
+          finishReason: finishReason ?? FinishReason.Stop,
+          usage: createUsage(inputTokens, outputTokens, outputTokens === 0)
+        };
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  // --- Translation: Facade → Anthropic Wire ---
+  translateRequest(request) {
+    const wire = {
+      model: request.model.modelId,
+      max_tokens: request.parameters.constraints?.maxTokens ?? 4096
+    };
+    const systemMessages = [];
+    const conversationMessages = [];
+    for (const msg of request.messages) {
+      if (msg.role === "system") {
+        const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+        if (text)
+          systemMessages.push(text);
+      } else if (msg.role === "tool") {
+        const toolResult = {
+          type: "tool_result",
+          tool_use_id: msg.toolCallId,
+          content: this.contentToWireString(msg.content)
+        };
+        const prev = conversationMessages[conversationMessages.length - 1];
+        if (prev && prev.role === "user" && Array.isArray(prev.content)) {
+          prev.content.push(toolResult);
+        } else {
+          conversationMessages.push({ role: "user", content: [toolResult] });
+        }
+      } else if (msg.role === "assistant") {
+        conversationMessages.push({
+          role: "assistant",
+          content: this.contentToAnthropicBlocks(msg.content)
+        });
+      } else {
+        conversationMessages.push({
+          role: "user",
+          content: this.contentToAnthropicBlocks(msg.content)
+        });
+      }
+    }
+    if (systemMessages.length > 0) {
+      wire.system = systemMessages.join("\n\n");
+    }
+    wire.messages = conversationMessages;
+    const params = request.parameters;
+    if (params.sampling?.temperature !== void 0)
+      wire.temperature = params.sampling.temperature;
+    if (params.sampling?.topP !== void 0)
+      wire.top_p = params.sampling.topP;
+    if (params.sampling?.topK !== void 0)
+      wire.top_k = params.sampling.topK;
+    if (params.constraints?.stopSequences !== void 0)
+      wire.stop_sequences = params.constraints.stopSequences;
+    if (params.structural?.tools && params.structural.tools.length > 0) {
+      wire.tools = params.structural.tools.map((t) => ({
+        name: t.name,
+        description: t.description ?? "",
+        input_schema: t.parameters ?? { type: "object", properties: {} }
+      }));
+    }
+    return wire;
+  }
+  contentToAnthropicBlocks(content) {
+    return content.map((block) => {
+      switch (block.type) {
+        case "text":
+          return { type: "text", text: block.text };
+        case "tool_use":
+          return { type: "tool_use", id: block.toolUseId, name: block.name, input: block.input };
+        case "tool_result":
+          return { type: "tool_result", tool_use_id: block.toolUseId, content: this.contentToWireString(block.content) };
+        case "thinking":
+          return { type: "thinking", thinking: block.thinking, signature: block.signature };
+        case "image":
+          if (block.data) {
+            return { type: "image", source: { type: "base64", media_type: block.mediaType, data: block.data } };
+          }
+          return { type: "image", source: { type: "url", url: block.sourceUrl } };
+      }
+    });
+  }
+  contentToWireString(content) {
+    return content.map((b) => b.type === "text" ? b.text : `[${b.type}]`).join("");
+  }
+  // --- Translation: Anthropic Wire → Facade ---
+  translateResponse(data) {
+    const content = [];
+    for (const block of data.content) {
+      switch (block.type) {
+        case "text":
+          content.push({ type: "text", text: block.text });
+          break;
+        case "tool_use":
+          content.push({
+            type: "tool_use",
+            toolUseId: block.id,
+            name: block.name,
+            input: block.input
+          });
+          break;
+        case "thinking":
+          content.push({
+            type: "thinking",
+            thinking: block.thinking,
+            signature: block.signature
+          });
+          break;
+      }
+    }
+    if (content.length === 0) {
+      content.push({ type: "text", text: "" });
+    }
+    return {
+      completionId: data.id,
+      model: data.model,
+      content,
+      finishReason: this.mapStopReason(data.stop_reason),
+      usage: createUsage(data.usage.input_tokens, data.usage.output_tokens, false)
+    };
+  }
+  mapStopReason(reason) {
+    switch (reason) {
+      case "end_turn":
+        return FinishReason.Stop;
+      case "stop_sequence":
+        return FinishReason.Stop;
+      case "max_tokens":
+        return FinishReason.Length;
+      case "tool_use":
+        return FinishReason.ToolUse;
+      default:
+        if (reason)
+          console.error(`[anthropic] unknown stop_reason: '${reason}'`);
+        return FinishReason.Stop;
+    }
+  }
+  translateError(status, body) {
+    const correlationId = `err_${Date.now().toString(36)}`;
+    switch (status) {
+      case 400:
+        return new FacadeError("precondition.validation_error", "INVALID_PARAMS", body, correlationId, false);
+      case 401:
+        return new FacadeError("precondition.authentication", "AUTH_FAILED", "Invalid Anthropic API key", correlationId, false);
+      case 403:
+        return new FacadeError("precondition.permission", "PERMISSION_DENIED", "Insufficient access", correlationId, false);
+      case 404:
+        return new FacadeError("precondition.model_not_found", "MODEL_NOT_FOUND", "Model not found", correlationId, false);
+      case 429:
+        return new FacadeError("capacity.rate_limited", "RATE_LIMITED", "Rate limited", correlationId, true);
+      case 529:
+        return new FacadeError("capacity.overloaded", "OVERLOADED", "Anthropic API overloaded", correlationId, true);
+      default:
+        return new FacadeError("system.provider_error", "PROVIDER_ERROR", `HTTP ${status}`, correlationId, true);
+    }
+  }
+  buildHeaders() {
+    return {
+      "Content-Type": "application/json",
+      "x-api-key": this.apiKey,
+      "anthropic-version": this.apiVersion
+    };
+  }
+};
+
 // dist/index.js
 function wireBlockToFacade(block) {
   switch (block.type) {
@@ -30746,6 +31115,12 @@ if (process.env.OPENAI_API_KEY) {
     apiKey: process.env.OPENAI_API_KEY
   }));
   console.error("[mcp] OpenAI provider registered");
+}
+if (process.env.ANTHROPIC_API_KEY) {
+  registry2.register(new AnthropicAdapter({
+    apiKey: process.env.ANTHROPIC_API_KEY
+  }));
+  console.error("[mcp] Anthropic provider registered");
 }
 var facade = new FacadeCore(registry2);
 var server = new McpServer({
