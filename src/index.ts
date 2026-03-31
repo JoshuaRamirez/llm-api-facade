@@ -52,6 +52,48 @@ if (process.env.ANTHROPIC_API_KEY) {
   console.error("[mcp] Anthropic provider registered");
 }
 
+if (process.env.MISTRAL_API_KEY) {
+  registry.register(new OpenAICompatAdapter({
+    providerId: "mistral",
+    baseUrl: "https://api.mistral.ai",
+    apiKey: process.env.MISTRAL_API_KEY,
+  }));
+  console.error("[mcp] Mistral provider registered");
+}
+
+if (process.env.XAI_API_KEY) {
+  registry.register(new OpenAICompatAdapter({
+    providerId: "xai",
+    baseUrl: "https://api.x.ai",
+    apiKey: process.env.XAI_API_KEY,
+  }));
+  console.error("[mcp] xAI provider registered");
+}
+
+if (process.env.VLLM_BASE_URL) {
+  registry.register(new OpenAICompatAdapter({
+    providerId: "vllm",
+    baseUrl: process.env.VLLM_BASE_URL,
+  }));
+  console.error("[mcp] vLLM provider registered");
+}
+
+if (process.env.LMSTUDIO_BASE_URL) {
+  registry.register(new OpenAICompatAdapter({
+    providerId: "lmstudio",
+    baseUrl: process.env.LMSTUDIO_BASE_URL,
+  }));
+  console.error("[mcp] LM Studio provider registered");
+}
+
+if (process.env.LLAMACPP_BASE_URL) {
+  registry.register(new OpenAICompatAdapter({
+    providerId: "llamacpp",
+    baseUrl: process.env.LLAMACPP_BASE_URL,
+  }));
+  console.error("[mcp] llama.cpp provider registered");
+}
+
 const facade = new FacadeCore(registry);
 const server = new McpServer({
   name: "llm-api-facade",
