@@ -81,7 +81,7 @@ export class CohereAdapter implements CompletionProvider {
     }
 
     const data = await response.json() as CohereResponse;
-    return this.translateResponse(data);
+    return this.translateResponse(data, request.model.modelId);
   }
 
   async *completeStream(request: NormalizedRequest): AsyncIterable<CompletionChunk> {
@@ -105,6 +105,7 @@ export class CohereAdapter implements CompletionProvider {
 
     let completionId = `cpl_${Date.now().toString(36)}`;
     let chunkIndex = 0;
+    let toolCallBlockIndex = 0;
     let inputTokens = 0;
     let outputTokens = 0;
     let finalFinishReason: FinishReason | undefined;
@@ -159,10 +160,11 @@ export class CohereAdapter implements CompletionProvider {
 
             case "tool-call-start": {
               const e = event as CohereToolCallStart;
+              toolCallBlockIndex++;
               yield {
                 completionId,
                 chunkIndex: chunkIndex++,
-                blockIndex: 1,
+                blockIndex: toolCallBlockIndex,
                 delta: {
                   type: "tool_use_delta" as const,
                   toolUseId: e.delta?.message?.tool_calls?.id,
@@ -178,7 +180,7 @@ export class CohereAdapter implements CompletionProvider {
               yield {
                 completionId,
                 chunkIndex: chunkIndex++,
-                blockIndex: 1,
+                blockIndex: toolCallBlockIndex,
                 delta: {
                   type: "tool_use_delta" as const,
                   inputJsonDelta: e.delta?.message?.tool_calls?.function?.arguments ?? "",
@@ -199,7 +201,7 @@ export class CohereAdapter implements CompletionProvider {
       }
 
       // Guarantee final usage chunk
-      if (!usageEmitted && chunkIndex > 0) {
+      if (!usageEmitted) {
         usageEmitted = true;
         yield {
           completionId,
@@ -306,7 +308,7 @@ export class CohereAdapter implements CompletionProvider {
 
   // --- Translation: Cohere Wire → Facade ---
 
-  private translateResponse(data: CohereResponse): CompletionResponse {
+  private translateResponse(data: CohereResponse, modelId: string): CompletionResponse {
     const content: ContentBlock[] = [];
 
     // Text content from message.content array
@@ -342,7 +344,7 @@ export class CohereAdapter implements CompletionProvider {
 
     return {
       completionId: data.id,
-      model: data.message?.role === "assistant" ? "cohere" : "cohere",
+      model: modelId,
       content,
       finishReason: this.mapFinishReason(data.finish_reason),
       usage: createUsage(
@@ -375,8 +377,12 @@ export class CohereAdapter implements CompletionProvider {
       case 402: return new FacadeError("capacity.quota_exceeded", "QUOTA_EXCEEDED", "Cohere billing limit reached", correlationId, false);
       case 403: return new FacadeError("precondition.permission", "PERMISSION_DENIED", "Forbidden", correlationId, false);
       case 404: return new FacadeError("precondition.model_not_found", "MODEL_NOT_FOUND", "Model not found", correlationId, false);
+      case 422: return new FacadeError("precondition.validation_error", "MALFORMED_REQUEST", "Malformed request structure", correlationId, false);
       case 429: return new FacadeError("capacity.rate_limited", "RATE_LIMITED", "Rate limited", correlationId, true);
       case 498: return new FacadeError("precondition.validation_error", "TOKEN_DENIED", "Deny-listed token detected", correlationId, false);
+      case 499: return new FacadeError("process.stream_interrupted", "CLIENT_CANCELLED", "Request cancelled by client", correlationId, false);
+      case 500: return new FacadeError("system.provider_error", "INTERNAL_ERROR", "Cohere internal server error", correlationId, true);
+      case 501: return new FacadeError("system.provider_error", "NOT_IMPLEMENTED", "Feature unavailable", correlationId, false);
       case 503: return new FacadeError("capacity.overloaded", "OVERLOADED", "Cohere service unavailable", correlationId, true);
       case 504: return new FacadeError("process.timeout", "TIMEOUT", "Cohere request timed out", correlationId, true);
       default: return new FacadeError("system.provider_error", "PROVIDER_ERROR", `HTTP ${status}`, correlationId, true);

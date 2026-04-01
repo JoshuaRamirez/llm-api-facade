@@ -30735,7 +30735,7 @@ var AnthropicAdapter = class {
       identity: createModelIdentity(this.providerId, modelId),
       capabilities: {
         contextWindow: 2e5,
-        maxOutputTokens: 8192,
+        maxOutputTokens: modelId.includes("opus") ? 128e3 : modelId.includes("sonnet") ? 64e3 : modelId.includes("haiku") ? 64e3 : 8192,
         supportsStreaming: true,
         supportsSystemMessage: true,
         supportsToolCalling: true,
@@ -30794,6 +30794,7 @@ var AnthropicAdapter = class {
     let finishReason;
     let usageEmitted = false;
     const toolInputAccumulators = /* @__PURE__ */ new Map();
+    const thinkingAccumulators = /* @__PURE__ */ new Map();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -30843,6 +30844,8 @@ var AnthropicAdapter = class {
                   }
                 };
               } else if (block.type === "thinking") {
+                thinkingAccumulators.set(e.index, { thinking: "", signature: "" });
+              } else if (block.type === "redacted_thinking") {
               }
               break;
             }
@@ -30868,12 +30871,19 @@ var AnthropicAdapter = class {
                   }
                 };
               } else if (e.delta.type === "thinking_delta") {
+                const ta = thinkingAccumulators.get(e.index);
+                if (ta)
+                  ta.thinking += e.delta.thinking;
                 yield {
                   completionId,
                   chunkIndex: chunkIndex++,
                   blockIndex: e.index,
                   delta: { type: "thinking_delta", thinking: e.delta.thinking }
                 };
+              } else if (e.delta.type === "signature_delta") {
+                const ta = thinkingAccumulators.get(e.index);
+                if (ta)
+                  ta.signature += e.delta.signature;
               }
               break;
             }
@@ -30909,7 +30919,23 @@ var AnthropicAdapter = class {
           }
         }
       }
-      if (buffer.trim() && buffer.trim().startsWith("data: ")) {
+      if (buffer.trim()) {
+        const lines = [buffer];
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data: "))
+            continue;
+          const payload = trimmed.slice(6);
+          try {
+            const event = JSON.parse(payload);
+            if (event.type === "message_delta") {
+              const e = event;
+              finishReason = this.mapStopReason(e.delta.stop_reason);
+              outputTokens = e.usage?.output_tokens ?? outputTokens;
+            }
+          } catch {
+          }
+        }
       }
       if (!usageEmitted && chunkIndex > 0) {
         yield {
@@ -30929,7 +30955,7 @@ var AnthropicAdapter = class {
   translateRequest(request) {
     const wire = {
       model: request.model.modelId,
-      max_tokens: request.parameters.constraints?.maxTokens ?? 4096
+      max_tokens: request.parameters.constraints?.maxTokens ?? 8192
     };
     const systemMessages = [];
     const conversationMessages = [];
@@ -30942,7 +30968,7 @@ var AnthropicAdapter = class {
         const toolResult = {
           type: "tool_result",
           tool_use_id: msg.toolCallId,
-          content: this.contentToWireString(msg.content)
+          content: this.contentToAnthropicBlocks(msg.content)
         };
         const prev = conversationMessages[conversationMessages.length - 1];
         if (prev && prev.role === "user" && Array.isArray(prev.content)) {
@@ -30992,7 +31018,7 @@ var AnthropicAdapter = class {
         case "tool_use":
           return { type: "tool_use", id: block.toolUseId, name: block.name, input: block.input };
         case "tool_result":
-          return { type: "tool_result", tool_use_id: block.toolUseId, content: this.contentToWireString(block.content) };
+          return { type: "tool_result", tool_use_id: block.toolUseId, content: this.contentToAnthropicBlocks(block.content) };
         case "thinking":
           return { type: "thinking", thinking: block.thinking, signature: block.signature };
         case "image":
@@ -31002,9 +31028,6 @@ var AnthropicAdapter = class {
           return { type: "image", source: { type: "url", url: block.sourceUrl } };
       }
     });
-  }
-  contentToWireString(content) {
-    return content.map((b) => b.type === "text" ? b.text : `[${b.type}]`).join("");
   }
   // --- Translation: Anthropic Wire → Facade ---
   translateResponse(data) {
@@ -31027,6 +31050,13 @@ var AnthropicAdapter = class {
             type: "thinking",
             thinking: block.thinking,
             signature: block.signature
+          });
+          break;
+        case "redacted_thinking":
+          content.push({
+            type: "thinking",
+            thinking: block.data ?? "",
+            signature: block.data ?? ""
           });
           break;
       }
@@ -31130,7 +31160,7 @@ var GeminiAdapter = class {
     console.error(`[gemini] POST generateContent model=${request.model.modelId}`);
     const response = await fetch(url2, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": this.apiKey },
       body: JSON.stringify(wireRequest)
     });
     if (!response.ok) {
@@ -31143,11 +31173,11 @@ var GeminiAdapter = class {
   }
   async *completeStream(request) {
     const wireRequest = this.translateRequest(request);
-    const url2 = this.buildUrl(request.model.modelId, "streamGenerateContent") + "&alt=sse";
+    const url2 = this.buildUrl(request.model.modelId, "streamGenerateContent") + "?alt=sse";
     const correlationId = `str_${Date.now().toString(36)}`;
     const response = await fetch(url2, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": this.apiKey },
       body: JSON.stringify(wireRequest)
     });
     if (!response.ok) {
@@ -31162,6 +31192,8 @@ var GeminiAdapter = class {
     let lastUsage;
     let usageEmitted = false;
     let lastFinishReason;
+    const textBlockIndex = 0;
+    let toolBlockCount = 0;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -31199,14 +31231,16 @@ var GeminiAdapter = class {
                 yield {
                   completionId,
                   chunkIndex: chunkIndex++,
-                  blockIndex: 0,
+                  blockIndex: textBlockIndex,
                   delta: { type: "text_delta", text: part.text }
                 };
               } else if (part.functionCall) {
+                const toolIdx = textBlockIndex + 1 + toolBlockCount;
+                toolBlockCount++;
                 yield {
                   completionId,
                   chunkIndex: chunkIndex++,
-                  blockIndex: 1,
+                  blockIndex: toolIdx,
                   delta: {
                     type: "tool_use_delta",
                     toolUseId: part.functionCall.id ?? `fc_${chunkIndex}`,
@@ -31236,7 +31270,7 @@ var GeminiAdapter = class {
           blockIndex: 0,
           delta: { type: "text_delta", text: "" },
           finishReason: lastFinishReason ?? FinishReason.Stop,
-          usage: lastUsage ? createUsage(lastUsage.promptTokenCount, lastUsage.candidatesTokenCount, false) : createUsage(0, chunkIndex, true)
+          usage: lastUsage ? createUsage(lastUsage.promptTokenCount, lastUsage.candidatesTokenCount, false) : createUsage(0, 0, true)
         };
       }
     } finally {
@@ -31246,6 +31280,14 @@ var GeminiAdapter = class {
   // --- Translation: Facade → Gemini Wire ---
   translateRequest(request) {
     const wire = {};
+    const toolNameMap = /* @__PURE__ */ new Map();
+    for (const msg of request.messages) {
+      for (const block of msg.content) {
+        if (block.type === "tool_use") {
+          toolNameMap.set(block.toolUseId, block.name);
+        }
+      }
+    }
     const systemParts = [];
     const contents = [];
     for (const msg of request.messages) {
@@ -31266,12 +31308,12 @@ var GeminiAdapter = class {
         contents.push({
           role: "model",
           // Gemini uses "model" not "assistant"
-          parts: this.contentToGeminiParts(msg.content)
+          parts: this.contentToGeminiParts(msg.content, toolNameMap)
         });
       } else {
         contents.push({
           role: "user",
-          parts: this.contentToGeminiParts(msg.content)
+          parts: this.contentToGeminiParts(msg.content, toolNameMap)
         });
       }
     }
@@ -31320,7 +31362,7 @@ var GeminiAdapter = class {
     }
     return wire;
   }
-  contentToGeminiParts(content) {
+  contentToGeminiParts(content, toolNameMap) {
     return content.map((block) => {
       switch (block.type) {
         case "text":
@@ -31336,7 +31378,7 @@ var GeminiAdapter = class {
         case "tool_result":
           return {
             functionResponse: {
-              name: "tool_result",
+              name: toolNameMap.get(block.toolUseId) ?? "tool_result",
               id: block.toolUseId,
               response: { result: this.contentToString(block.content) }
             }
@@ -31362,7 +31404,7 @@ var GeminiAdapter = class {
         }
       }
     }
-    return "unknown_tool";
+    throw new FacadeError("precondition.validation_error", "UNRESOLVABLE_TOOL_ID", `Cannot find tool name for toolCallId '${toolCallId}' in message history`, `err_${Date.now().toString(36)}`, false);
   }
   // --- Translation: Gemini Wire → Facade ---
   translateResponse(data) {
@@ -31461,7 +31503,7 @@ var GeminiAdapter = class {
     }
   }
   buildUrl(modelId, method) {
-    return `https://generativelanguage.googleapis.com/${this.apiVersion}/models/${modelId}:${method}?key=${this.apiKey}`;
+    return `https://generativelanguage.googleapis.com/${this.apiVersion}/models/${modelId}:${method}`;
   }
 };
 
@@ -31516,7 +31558,7 @@ var CohereAdapter = class {
       throw this.translateError(response.status, errorBody);
     }
     const data = await response.json();
-    return this.translateResponse(data);
+    return this.translateResponse(data, request.model.modelId);
   }
   async *completeStream(request) {
     const wireRequest = this.translateRequest(request, true);
@@ -31535,6 +31577,7 @@ var CohereAdapter = class {
     }
     let completionId = `cpl_${Date.now().toString(36)}`;
     let chunkIndex = 0;
+    let toolCallBlockIndex = 0;
     let inputTokens = 0;
     let outputTokens = 0;
     let finalFinishReason;
@@ -31584,10 +31627,11 @@ var CohereAdapter = class {
             }
             case "tool-call-start": {
               const e = event;
+              toolCallBlockIndex++;
               yield {
                 completionId,
                 chunkIndex: chunkIndex++,
-                blockIndex: 1,
+                blockIndex: toolCallBlockIndex,
                 delta: {
                   type: "tool_use_delta",
                   toolUseId: e.delta?.message?.tool_calls?.id,
@@ -31602,7 +31646,7 @@ var CohereAdapter = class {
               yield {
                 completionId,
                 chunkIndex: chunkIndex++,
-                blockIndex: 1,
+                blockIndex: toolCallBlockIndex,
                 delta: {
                   type: "tool_use_delta",
                   inputJsonDelta: e.delta?.message?.tool_calls?.function?.arguments ?? ""
@@ -31620,7 +31664,7 @@ var CohereAdapter = class {
           }
         }
       }
-      if (!usageEmitted && chunkIndex > 0) {
+      if (!usageEmitted) {
         usageEmitted = true;
         yield {
           completionId,
@@ -31717,7 +31761,7 @@ var CohereAdapter = class {
     return content.map((b) => b.type === "text" ? b.text : `[${b.type}]`).join("");
   }
   // --- Translation: Cohere Wire → Facade ---
-  translateResponse(data) {
+  translateResponse(data, modelId) {
     const content = [];
     if (data.message?.content) {
       for (const block of data.message.content) {
@@ -31747,7 +31791,7 @@ var CohereAdapter = class {
     }
     return {
       completionId: data.id,
-      model: data.message?.role === "assistant" ? "cohere" : "cohere",
+      model: modelId,
       content,
       finishReason: this.mapFinishReason(data.finish_reason),
       usage: createUsage(data.usage?.tokens?.input_tokens ?? 0, data.usage?.tokens?.output_tokens ?? 0, data.usage === void 0)
@@ -31786,10 +31830,18 @@ var CohereAdapter = class {
         return new FacadeError("precondition.permission", "PERMISSION_DENIED", "Forbidden", correlationId, false);
       case 404:
         return new FacadeError("precondition.model_not_found", "MODEL_NOT_FOUND", "Model not found", correlationId, false);
+      case 422:
+        return new FacadeError("precondition.validation_error", "MALFORMED_REQUEST", "Malformed request structure", correlationId, false);
       case 429:
         return new FacadeError("capacity.rate_limited", "RATE_LIMITED", "Rate limited", correlationId, true);
       case 498:
         return new FacadeError("precondition.validation_error", "TOKEN_DENIED", "Deny-listed token detected", correlationId, false);
+      case 499:
+        return new FacadeError("process.stream_interrupted", "CLIENT_CANCELLED", "Request cancelled by client", correlationId, false);
+      case 500:
+        return new FacadeError("system.provider_error", "INTERNAL_ERROR", "Cohere internal server error", correlationId, true);
+      case 501:
+        return new FacadeError("system.provider_error", "NOT_IMPLEMENTED", "Feature unavailable", correlationId, false);
       case 503:
         return new FacadeError("capacity.overloaded", "OVERLOADED", "Cohere service unavailable", correlationId, true);
       case 504:

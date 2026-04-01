@@ -45,7 +45,10 @@ export class AnthropicAdapter implements CompletionProvider {
       identity: createModelIdentity(this.providerId, modelId),
       capabilities: {
         contextWindow: 200000,
-        maxOutputTokens: 8192,
+        maxOutputTokens: modelId.includes("opus") ? 128000
+          : modelId.includes("sonnet") ? 64000
+          : modelId.includes("haiku") ? 64000
+          : 8192,
         supportsStreaming: true,
         supportsSystemMessage: true,
         supportsToolCalling: true,
@@ -115,6 +118,8 @@ export class AnthropicAdapter implements CompletionProvider {
 
     // Accumulator for tool_use input JSON fragments per block index
     const toolInputAccumulators: Map<number, string> = new Map();
+    // Accumulator for thinking block signatures per block index
+    const thinkingAccumulators: Map<number, { thinking: string; signature: string }> = new Map();
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -171,7 +176,9 @@ export class AnthropicAdapter implements CompletionProvider {
                   },
                 };
               } else if (block.type === "thinking") {
-                // Thinking block starting
+                thinkingAccumulators.set(e.index, { thinking: "", signature: "" });
+              } else if (block.type === "redacted_thinking") {
+                // Redacted thinking — opaque, no deltas will follow
               }
               break;
             }
@@ -198,12 +205,19 @@ export class AnthropicAdapter implements CompletionProvider {
                   },
                 };
               } else if (e.delta.type === "thinking_delta") {
+                const ta = thinkingAccumulators.get(e.index);
+                if (ta) ta.thinking += e.delta.thinking;
                 yield {
                   completionId,
                   chunkIndex: chunkIndex++,
                   blockIndex: e.index,
                   delta: { type: "thinking_delta" as const, thinking: e.delta.thinking },
                 };
+              } else if (e.delta.type === "signature_delta") {
+                // Signature accumulated for thinking block integrity; not yielded as a chunk
+                // The caller must reconstruct ThinkingBlock with signature from the full stream
+                const ta = thinkingAccumulators.get(e.index);
+                if (ta) ta.signature += (e.delta as unknown as { signature: string }).signature;
               }
               break;
             }
@@ -252,9 +266,22 @@ export class AnthropicAdapter implements CompletionProvider {
         }
       }
 
-      // Flush buffer
-      if (buffer.trim() && buffer.trim().startsWith("data: ")) {
-        // Process remaining line if present
+      // Flush buffer — process any remaining data line
+      if (buffer.trim()) {
+        const lines = [buffer];
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data: ")) continue;
+          const payload = trimmed.slice(6);
+          try {
+            const event = JSON.parse(payload) as AnthropicStreamEvent;
+            if (event.type === "message_delta") {
+              const e = event as AnthropicMessageDelta;
+              finishReason = this.mapStopReason(e.delta.stop_reason);
+              outputTokens = e.usage?.output_tokens ?? outputTokens;
+            }
+          } catch { /* ignore malformed final fragment */ }
+        }
       }
 
       // Guarantee usage chunk
@@ -278,7 +305,7 @@ export class AnthropicAdapter implements CompletionProvider {
   private translateRequest(request: NormalizedRequest): Record<string, unknown> {
     const wire: Record<string, unknown> = {
       model: request.model.modelId,
-      max_tokens: request.parameters.constraints?.maxTokens ?? 4096,
+      max_tokens: request.parameters.constraints?.maxTokens ?? 8192,
     };
 
     // Extract system messages → top-level system parameter
@@ -298,7 +325,7 @@ export class AnthropicAdapter implements CompletionProvider {
         const toolResult = {
           type: "tool_result",
           tool_use_id: msg.toolCallId,
-          content: this.contentToWireString(msg.content),
+          content: this.contentToAnthropicBlocks(msg.content),
         };
         // Check if previous message is a user message we can append to
         const prev = conversationMessages[conversationMessages.length - 1];
@@ -354,7 +381,7 @@ export class AnthropicAdapter implements CompletionProvider {
         case "tool_use":
           return { type: "tool_use", id: block.toolUseId, name: block.name, input: block.input };
         case "tool_result":
-          return { type: "tool_result", tool_use_id: block.toolUseId, content: this.contentToWireString(block.content) };
+          return { type: "tool_result", tool_use_id: block.toolUseId, content: this.contentToAnthropicBlocks(block.content) };
         case "thinking":
           return { type: "thinking", thinking: block.thinking, signature: block.signature };
         case "image":
@@ -364,12 +391,6 @@ export class AnthropicAdapter implements CompletionProvider {
           return { type: "image", source: { type: "url", url: block.sourceUrl } };
       }
     });
-  }
-
-  private contentToWireString(content: readonly ContentBlock[]): string {
-    return content
-      .map(b => b.type === "text" ? b.text : `[${b.type}]`)
-      .join("");
   }
 
   // --- Translation: Anthropic Wire → Facade ---
@@ -395,6 +416,15 @@ export class AnthropicAdapter implements CompletionProvider {
             type: "thinking",
             thinking: block.thinking,
             signature: block.signature,
+          });
+          break;
+        case "redacted_thinking":
+          // Pass through as a ThinkingBlock with the opaque data as the thinking field
+          // and an empty signature (the data IS the opaque representation)
+          content.push({
+            type: "thinking",
+            thinking: block.data ?? "",
+            signature: block.data ?? "",
           });
           break;
       }
@@ -465,6 +495,7 @@ interface AnthropicResponse {
     input: unknown;
     thinking: string;
     signature: string;
+    data: string;
   }>;
   model: string;
   stop_reason: string | null;

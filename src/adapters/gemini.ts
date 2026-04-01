@@ -73,7 +73,7 @@ export class GeminiAdapter implements CompletionProvider {
 
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": this.apiKey },
       body: JSON.stringify(wireRequest),
     });
 
@@ -89,12 +89,12 @@ export class GeminiAdapter implements CompletionProvider {
 
   async *completeStream(request: NormalizedRequest): AsyncIterable<CompletionChunk> {
     const wireRequest = this.translateRequest(request);
-    const url = this.buildUrl(request.model.modelId, "streamGenerateContent") + "&alt=sse";
+    const url = this.buildUrl(request.model.modelId, "streamGenerateContent") + "?alt=sse";
     const correlationId = `str_${Date.now().toString(36)}`;
 
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": this.apiKey },
       body: JSON.stringify(wireRequest),
     });
 
@@ -112,6 +112,8 @@ export class GeminiAdapter implements CompletionProvider {
     let lastUsage: GeminiUsageMetadata | undefined;
     let usageEmitted = false;
     let lastFinishReason: FinishReason | undefined;
+    const textBlockIndex = 0;
+    let toolBlockCount = 0;
 
 
     const reader = response.body.getReader();
@@ -153,19 +155,21 @@ export class GeminiAdapter implements CompletionProvider {
           if (candidate.content?.parts) {
             for (const part of candidate.content.parts) {
               if (part.text !== undefined) {
-                // Gemini streams incremental text per chunk
+                // Gemini streams incremental text per chunk — same block across chunks
                 yield {
                   completionId,
                   chunkIndex: chunkIndex++,
-                  blockIndex: 0,
+                  blockIndex: textBlockIndex,
                   delta: { type: "text_delta" as const, text: part.text },
                 };
               } else if (part.functionCall) {
-                // Function calls arrive as complete objects in one chunk
+                // Each function call is a distinct block after the text block
+                const toolIdx = textBlockIndex + 1 + toolBlockCount;
+                toolBlockCount++;
                 yield {
                   completionId,
                   chunkIndex: chunkIndex++,
-                  blockIndex: 1,
+                  blockIndex: toolIdx,
                   delta: {
                     type: "tool_use_delta" as const,
                     toolUseId: part.functionCall.id ?? `fc_${chunkIndex}`,
@@ -202,7 +206,7 @@ export class GeminiAdapter implements CompletionProvider {
           finishReason: lastFinishReason ?? FinishReason.Stop,
           usage: lastUsage
             ? createUsage(lastUsage.promptTokenCount, lastUsage.candidatesTokenCount, false)
-            : createUsage(0, chunkIndex, true),
+            : createUsage(0, 0, true),
         };
       }
     } finally {
@@ -214,6 +218,16 @@ export class GeminiAdapter implements CompletionProvider {
 
   private translateRequest(request: NormalizedRequest): Record<string, unknown> {
     const wire: Record<string, unknown> = {};
+
+    // Build tool name map from all tool_use blocks in conversation history
+    const toolNameMap = new Map<string, string>();
+    for (const msg of request.messages) {
+      for (const block of msg.content) {
+        if (block.type === "tool_use") {
+          toolNameMap.set(block.toolUseId, block.name);
+        }
+      }
+    }
 
     // Extract system messages → systemInstruction
     const systemParts: string[] = [];
@@ -239,12 +253,12 @@ export class GeminiAdapter implements CompletionProvider {
       } else if (msg.role === "assistant") {
         contents.push({
           role: "model", // Gemini uses "model" not "assistant"
-          parts: this.contentToGeminiParts(msg.content),
+          parts: this.contentToGeminiParts(msg.content, toolNameMap),
         });
       } else {
         contents.push({
           role: "user",
-          parts: this.contentToGeminiParts(msg.content),
+          parts: this.contentToGeminiParts(msg.content, toolNameMap),
         });
       }
     }
@@ -296,7 +310,7 @@ export class GeminiAdapter implements CompletionProvider {
     return wire;
   }
 
-  private contentToGeminiParts(content: readonly ContentBlock[]): unknown[] {
+  private contentToGeminiParts(content: readonly ContentBlock[], toolNameMap: Map<string, string>): unknown[] {
     return content.map(block => {
       switch (block.type) {
         case "text":
@@ -312,7 +326,7 @@ export class GeminiAdapter implements CompletionProvider {
         case "tool_result":
           return {
             functionResponse: {
-              name: "tool_result",
+              name: toolNameMap.get(block.toolUseId) ?? "tool_result",
               id: block.toolUseId,
               response: { result: this.contentToString(block.content) },
             },
@@ -343,7 +357,13 @@ export class GeminiAdapter implements CompletionProvider {
         }
       }
     }
-    return "unknown_tool";
+    throw new FacadeError(
+      "precondition.validation_error",
+      "UNRESOLVABLE_TOOL_ID",
+      `Cannot find tool name for toolCallId '${toolCallId}' in message history`,
+      `err_${Date.now().toString(36)}`,
+      false,
+    );
   }
 
   // --- Translation: Gemini Wire → Facade ---
@@ -454,7 +474,7 @@ export class GeminiAdapter implements CompletionProvider {
   }
 
   private buildUrl(modelId: string, method: string): string {
-    return `https://generativelanguage.googleapis.com/${this.apiVersion}/models/${modelId}:${method}?key=${this.apiKey}`;
+    return `https://generativelanguage.googleapis.com/${this.apiVersion}/models/${modelId}:${method}`;
   }
 }
 
