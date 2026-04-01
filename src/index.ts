@@ -5,6 +5,8 @@ import { ProviderRegistry } from "./facade/provider-registry.js";
 import { FacadeCore } from "./facade/facade-core.js";
 import { OpenAICompatAdapter } from "./adapters/openai-compat.js";
 import { AnthropicAdapter } from "./adapters/anthropic.js";
+import { GeminiAdapter } from "./adapters/gemini.js";
+import { CohereAdapter } from "./adapters/cohere.js";
 import { createMessage, FacadeError, type ContentBlock } from "./types/index.js";
 
 // --- Wire format → Facade type mapping (snake_case → camelCase) ---
@@ -50,6 +52,20 @@ if (process.env.ANTHROPIC_API_KEY) {
     apiKey: process.env.ANTHROPIC_API_KEY,
   }));
   console.error("[mcp] Anthropic provider registered");
+}
+
+if (process.env.GEMINI_API_KEY) {
+  registry.register(new GeminiAdapter({
+    apiKey: process.env.GEMINI_API_KEY,
+  }));
+  console.error("[mcp] Gemini provider registered");
+}
+
+if (process.env.COHERE_API_KEY) {
+  registry.register(new CohereAdapter({
+    apiKey: process.env.COHERE_API_KEY,
+  }));
+  console.error("[mcp] Cohere provider registered");
 }
 
 if (process.env.MISTRAL_API_KEY) {

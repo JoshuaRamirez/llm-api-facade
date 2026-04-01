@@ -31086,6 +31086,726 @@ var AnthropicAdapter = class {
   }
 };
 
+// dist/adapters/gemini.js
+var GeminiAdapter = class {
+  providerId = "gemini";
+  apiKey;
+  apiVersion;
+  constructor(config2) {
+    this.apiKey = config2.apiKey;
+    this.apiVersion = config2.apiVersion ?? "v1beta";
+  }
+  async resolveModel(modelId) {
+    if (!modelId.startsWith("gemini-")) {
+      return null;
+    }
+    return {
+      identity: createModelIdentity(this.providerId, modelId),
+      capabilities: {
+        contextWindow: 1048576,
+        maxOutputTokens: 65536,
+        supportsStreaming: true,
+        supportsSystemMessage: true,
+        supportsToolCalling: true,
+        supportsThinking: modelId.includes("2.5") || modelId.includes("3"),
+        supportsVision: true,
+        requiresAlternation: true,
+        modelReadiness: { state: "available" },
+        supportedParameters: {
+          temperature: { supported: true, min: 0, max: 2, default: 1 },
+          topP: { supported: true, min: 0, max: 1, default: 0.95 },
+          topK: { supported: true, min: 1 },
+          frequencyPenalty: { supported: true, min: -2, max: 2, default: 0 },
+          presencePenalty: { supported: true, min: -2, max: 2, default: 0 },
+          seed: { supported: true },
+          stopSequences: { supported: true }
+        },
+        availableExtensions: []
+      }
+    };
+  }
+  async complete(request) {
+    const wireRequest = this.translateRequest(request);
+    const url2 = this.buildUrl(request.model.modelId, "generateContent");
+    console.error(`[gemini] POST generateContent model=${request.model.modelId}`);
+    const response = await fetch(url2, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(wireRequest)
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`[gemini] error ${response.status}`);
+      throw this.translateError(response.status, errorBody);
+    }
+    const data = await response.json();
+    return this.translateResponse(data);
+  }
+  async *completeStream(request) {
+    const wireRequest = this.translateRequest(request);
+    const url2 = this.buildUrl(request.model.modelId, "streamGenerateContent") + "&alt=sse";
+    const correlationId = `str_${Date.now().toString(36)}`;
+    const response = await fetch(url2, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(wireRequest)
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw this.translateError(response.status, errorBody);
+    }
+    if (!response.body) {
+      throw new FacadeError("system.provider_error", "NO_STREAM_BODY", "No response body for stream", correlationId, true);
+    }
+    let completionId = `cpl_${Date.now().toString(36)}`;
+    let chunkIndex = 0;
+    let lastUsage;
+    let usageEmitted = false;
+    let lastFinishReason;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data: "))
+            continue;
+          const payload = trimmed.slice(6);
+          let chunk;
+          try {
+            chunk = JSON.parse(payload);
+          } catch {
+            throw new FacadeError("process.stream_interrupted", "MALFORMED_STREAM_CHUNK", "Failed to parse Gemini SSE chunk", correlationId, true);
+          }
+          if (chunk.usageMetadata) {
+            lastUsage = chunk.usageMetadata;
+          }
+          const candidate = chunk.candidates?.[0];
+          if (!candidate)
+            continue;
+          if (candidate.finishReason) {
+            lastFinishReason = this.mapFinishReason(candidate.finishReason, candidate.content?.parts);
+          }
+          if (candidate.content?.parts) {
+            for (const part of candidate.content.parts) {
+              if (part.text !== void 0) {
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: 0,
+                  delta: { type: "text_delta", text: part.text }
+                };
+              } else if (part.functionCall) {
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: 1,
+                  delta: {
+                    type: "tool_use_delta",
+                    toolUseId: part.functionCall.id ?? `fc_${chunkIndex}`,
+                    name: part.functionCall.name,
+                    inputJsonDelta: JSON.stringify(part.functionCall.args ?? {})
+                  }
+                };
+              }
+            }
+          }
+        }
+      }
+      if (buffer.trim() && buffer.trim().startsWith("data: ")) {
+        const payload = buffer.trim().slice(6);
+        try {
+          const chunk = JSON.parse(payload);
+          if (chunk.usageMetadata)
+            lastUsage = chunk.usageMetadata;
+        } catch {
+        }
+      }
+      if (!usageEmitted && chunkIndex > 0) {
+        usageEmitted = true;
+        yield {
+          completionId,
+          chunkIndex,
+          blockIndex: 0,
+          delta: { type: "text_delta", text: "" },
+          finishReason: lastFinishReason ?? FinishReason.Stop,
+          usage: lastUsage ? createUsage(lastUsage.promptTokenCount, lastUsage.candidatesTokenCount, false) : createUsage(0, chunkIndex, true)
+        };
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  // --- Translation: Facade → Gemini Wire ---
+  translateRequest(request) {
+    const wire = {};
+    const systemParts = [];
+    const contents = [];
+    for (const msg of request.messages) {
+      if (msg.role === "system") {
+        const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+        if (text)
+          systemParts.push(text);
+      } else if (msg.role === "tool") {
+        const functionResponse = {
+          functionResponse: {
+            name: this.findToolName(request, msg.toolCallId),
+            id: msg.toolCallId,
+            response: { result: this.contentToString(msg.content) }
+          }
+        };
+        contents.push({ role: "user", parts: [functionResponse] });
+      } else if (msg.role === "assistant") {
+        contents.push({
+          role: "model",
+          // Gemini uses "model" not "assistant"
+          parts: this.contentToGeminiParts(msg.content)
+        });
+      } else {
+        contents.push({
+          role: "user",
+          parts: this.contentToGeminiParts(msg.content)
+        });
+      }
+    }
+    if (systemParts.length > 0) {
+      wire.systemInstruction = { parts: [{ text: systemParts.join("\n\n") }] };
+    }
+    wire.contents = contents;
+    const genConfig = {};
+    const params = request.parameters;
+    if (params.sampling?.temperature !== void 0)
+      genConfig.temperature = params.sampling.temperature;
+    if (params.sampling?.topP !== void 0)
+      genConfig.topP = params.sampling.topP;
+    if (params.sampling?.topK !== void 0)
+      genConfig.topK = params.sampling.topK;
+    if (params.constraints?.maxTokens !== void 0)
+      genConfig.maxOutputTokens = params.constraints.maxTokens;
+    if (params.constraints?.stopSequences !== void 0)
+      genConfig.stopSequences = params.constraints.stopSequences;
+    if (params.behavioral?.frequencyPenalty !== void 0)
+      genConfig.frequencyPenalty = params.behavioral.frequencyPenalty;
+    if (params.behavioral?.presencePenalty !== void 0)
+      genConfig.presencePenalty = params.behavioral.presencePenalty;
+    if (params.meta?.seed !== void 0)
+      genConfig.seed = params.meta.seed;
+    if (params.structural?.responseFormat) {
+      const rf = params.structural.responseFormat;
+      if (rf.type === "json" || rf.type === "json_schema") {
+        genConfig.responseMimeType = "application/json";
+        if (rf.schema) {
+          genConfig.responseSchema = rf.schema;
+        }
+      }
+    }
+    if (Object.keys(genConfig).length > 0) {
+      wire.generationConfig = genConfig;
+    }
+    if (params.structural?.tools && params.structural.tools.length > 0) {
+      wire.tools = [{
+        functionDeclarations: params.structural.tools.map((t) => ({
+          name: t.name,
+          description: t.description ?? "",
+          parameters: t.parameters ?? { type: "object", properties: {} }
+        }))
+      }];
+    }
+    return wire;
+  }
+  contentToGeminiParts(content) {
+    return content.map((block) => {
+      switch (block.type) {
+        case "text":
+          return { text: block.text };
+        case "tool_use":
+          return {
+            functionCall: {
+              name: block.name,
+              id: block.toolUseId,
+              args: block.input
+            }
+          };
+        case "tool_result":
+          return {
+            functionResponse: {
+              name: "tool_result",
+              id: block.toolUseId,
+              response: { result: this.contentToString(block.content) }
+            }
+          };
+        case "thinking":
+          return { text: block.thinking };
+        case "image":
+          if (block.data) {
+            return { inlineData: { mimeType: block.mediaType, data: block.data } };
+          }
+          return { fileData: { mimeType: block.mediaType, fileUri: block.sourceUrl } };
+      }
+    });
+  }
+  contentToString(content) {
+    return content.map((b) => b.type === "text" ? b.text : `[${b.type}]`).join("");
+  }
+  findToolName(request, toolCallId) {
+    for (const msg of request.messages) {
+      for (const block of msg.content) {
+        if (block.type === "tool_use" && block.toolUseId === toolCallId) {
+          return block.name;
+        }
+      }
+    }
+    return "unknown_tool";
+  }
+  // --- Translation: Gemini Wire → Facade ---
+  translateResponse(data) {
+    const candidate = data.candidates?.[0];
+    if (!candidate) {
+      if (data.promptFeedback?.blockReason) {
+        return {
+          completionId: data.responseId ?? `cpl_${Date.now().toString(36)}`,
+          model: data.modelVersion ?? "gemini",
+          content: [{ type: "text", text: "" }],
+          finishReason: FinishReason.ContentFilter,
+          usage: createUsage(data.usageMetadata?.promptTokenCount ?? 0, 0, data.usageMetadata === void 0)
+        };
+      }
+      throw new FacadeError("system.provider_error", "NO_CANDIDATES", "No candidates in Gemini response", `err_${Date.now().toString(36)}`, true);
+    }
+    const content = [];
+    if (candidate.content?.parts) {
+      for (const part of candidate.content.parts) {
+        if (part.text !== void 0) {
+          content.push({ type: "text", text: part.text });
+        } else if (part.functionCall) {
+          content.push({
+            type: "tool_use",
+            toolUseId: part.functionCall.id ?? `fc_${Date.now().toString(36)}`,
+            name: part.functionCall.name,
+            input: part.functionCall.args ?? {}
+          });
+        }
+      }
+    }
+    if (content.length === 0) {
+      content.push({ type: "text", text: "" });
+    }
+    const finishReason = this.mapFinishReason(candidate.finishReason, candidate.content?.parts);
+    return {
+      completionId: data.responseId ?? `cpl_${Date.now().toString(36)}`,
+      model: data.modelVersion ?? "gemini",
+      content,
+      finishReason,
+      usage: createUsage(data.usageMetadata?.promptTokenCount ?? 0, data.usageMetadata?.candidatesTokenCount ?? 0, data.usageMetadata === void 0)
+    };
+  }
+  mapFinishReason(reason, parts) {
+    if (parts?.some((p) => p.functionCall)) {
+      return FinishReason.ToolUse;
+    }
+    switch (reason) {
+      case "STOP":
+      case "FINISH_REASON_STOP":
+        return FinishReason.Stop;
+      case "MAX_TOKENS":
+      case "FINISH_REASON_MAX_TOKENS":
+        return FinishReason.Length;
+      case "SAFETY":
+      case "RECITATION":
+      case "BLOCKLIST":
+      case "PROHIBITED_CONTENT":
+      case "IMAGE_PROHIBITED_CONTENT":
+      case "SPII":
+      case "FINISH_REASON_SAFETY":
+      case "FINISH_REASON_RECITATION":
+      case "FINISH_REASON_BLOCKLIST":
+      case "FINISH_REASON_PROHIBITED_CONTENT":
+        return FinishReason.ContentFilter;
+      case "MALFORMED_FUNCTION_CALL":
+      case "FINISH_REASON_MALFORMED_FUNCTION_CALL":
+      case "NO_IMAGE":
+      case "FINISH_REASON_NO_IMAGE":
+        return FinishReason.Error;
+      default:
+        if (reason)
+          console.error(`[gemini] unknown finishReason: '${reason}'`);
+        return FinishReason.Stop;
+    }
+  }
+  translateError(status, body) {
+    const correlationId = `err_${Date.now().toString(36)}`;
+    switch (status) {
+      case 400:
+        return new FacadeError("precondition.validation_error", "INVALID_PARAMS", body, correlationId, false);
+      case 403:
+        return new FacadeError("precondition.permission", "PERMISSION_DENIED", "Invalid Gemini API key or insufficient permissions", correlationId, false);
+      case 404:
+        return new FacadeError("precondition.model_not_found", "MODEL_NOT_FOUND", "Model not found", correlationId, false);
+      case 429:
+        return new FacadeError("capacity.rate_limited", "RATE_LIMITED", "Rate limited", correlationId, true);
+      case 500:
+        return new FacadeError("system.provider_error", "PROVIDER_ERROR", "Gemini internal error", correlationId, true);
+      case 503:
+        return new FacadeError("capacity.overloaded", "OVERLOADED", "Gemini service unavailable", correlationId, true);
+      case 504:
+        return new FacadeError("process.timeout", "TIMEOUT", "Gemini request timed out", correlationId, true);
+      default:
+        return new FacadeError("system.provider_error", "PROVIDER_ERROR", `HTTP ${status}`, correlationId, true);
+    }
+  }
+  buildUrl(modelId, method) {
+    return `https://generativelanguage.googleapis.com/${this.apiVersion}/models/${modelId}:${method}?key=${this.apiKey}`;
+  }
+};
+
+// dist/adapters/cohere.js
+var CohereAdapter = class {
+  providerId = "cohere";
+  apiKey;
+  constructor(config2) {
+    this.apiKey = config2.apiKey;
+  }
+  async resolveModel(modelId) {
+    const knownPrefixes = ["command-", "c4ai-"];
+    if (!knownPrefixes.some((p) => modelId.startsWith(p))) {
+      return null;
+    }
+    return {
+      identity: createModelIdentity(this.providerId, modelId),
+      capabilities: {
+        contextWindow: 128e3,
+        maxOutputTokens: 4096,
+        supportsStreaming: true,
+        supportsSystemMessage: true,
+        supportsToolCalling: true,
+        supportsThinking: modelId.includes("reasoning"),
+        supportsVision: modelId.includes("vision"),
+        requiresAlternation: false,
+        modelReadiness: { state: "available" },
+        supportedParameters: {
+          temperature: { supported: true, min: 0, max: 5, default: 0.3 },
+          topP: { supported: true, min: 0.01, max: 0.99, default: 0.75 },
+          topK: { supported: true, min: 0, max: 500, default: 0 },
+          frequencyPenalty: { supported: true, min: 0, max: 1, default: 0 },
+          presencePenalty: { supported: true, min: 0, max: 1, default: 0 },
+          seed: { supported: true },
+          stopSequences: { supported: true }
+        },
+        availableExtensions: []
+      }
+    };
+  }
+  async complete(request) {
+    const wireRequest = this.translateRequest(request, false);
+    console.error(`[cohere] POST /v2/chat model=${wireRequest.model}`);
+    const response = await fetch("https://api.cohere.com/v2/chat", {
+      method: "POST",
+      headers: this.buildHeaders(),
+      body: JSON.stringify(wireRequest)
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`[cohere] error ${response.status}`);
+      throw this.translateError(response.status, errorBody);
+    }
+    const data = await response.json();
+    return this.translateResponse(data);
+  }
+  async *completeStream(request) {
+    const wireRequest = this.translateRequest(request, true);
+    const correlationId = `str_${Date.now().toString(36)}`;
+    const response = await fetch("https://api.cohere.com/v2/chat", {
+      method: "POST",
+      headers: this.buildHeaders(),
+      body: JSON.stringify(wireRequest)
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw this.translateError(response.status, errorBody);
+    }
+    if (!response.body) {
+      throw new FacadeError("system.provider_error", "NO_STREAM_BODY", "No response body for stream", correlationId, true);
+    }
+    let completionId = `cpl_${Date.now().toString(36)}`;
+    let chunkIndex = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let finalFinishReason;
+    let usageEmitted = false;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data: "))
+            continue;
+          const payload = trimmed.slice(6);
+          if (payload === "[DONE]")
+            continue;
+          let event;
+          try {
+            event = JSON.parse(payload);
+          } catch {
+            throw new FacadeError("process.stream_interrupted", "MALFORMED_STREAM_CHUNK", "Failed to parse Cohere SSE event", correlationId, true);
+          }
+          switch (event.type) {
+            case "message-start": {
+              const e = event;
+              completionId = e.id ?? completionId;
+              break;
+            }
+            case "content-delta": {
+              const e = event;
+              const text = e.delta?.message?.content?.text ?? "";
+              if (text) {
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: 0,
+                  delta: { type: "text_delta", text }
+                };
+              }
+              break;
+            }
+            case "tool-call-start": {
+              const e = event;
+              yield {
+                completionId,
+                chunkIndex: chunkIndex++,
+                blockIndex: 1,
+                delta: {
+                  type: "tool_use_delta",
+                  toolUseId: e.delta?.message?.tool_calls?.id,
+                  name: e.delta?.message?.tool_calls?.function?.name,
+                  inputJsonDelta: ""
+                }
+              };
+              break;
+            }
+            case "tool-call-delta": {
+              const e = event;
+              yield {
+                completionId,
+                chunkIndex: chunkIndex++,
+                blockIndex: 1,
+                delta: {
+                  type: "tool_use_delta",
+                  inputJsonDelta: e.delta?.message?.tool_calls?.function?.arguments ?? ""
+                }
+              };
+              break;
+            }
+            case "message-end": {
+              const e = event;
+              finalFinishReason = this.mapFinishReason(e.delta?.finish_reason);
+              inputTokens = e.delta?.usage?.tokens?.input_tokens ?? 0;
+              outputTokens = e.delta?.usage?.tokens?.output_tokens ?? 0;
+              break;
+            }
+          }
+        }
+      }
+      if (!usageEmitted && chunkIndex > 0) {
+        usageEmitted = true;
+        yield {
+          completionId,
+          chunkIndex,
+          blockIndex: 0,
+          delta: { type: "text_delta", text: "" },
+          finishReason: finalFinishReason ?? FinishReason.Stop,
+          usage: createUsage(inputTokens, outputTokens, inputTokens === 0 && outputTokens === 0)
+        };
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  // --- Translation: Facade → Cohere Wire ---
+  translateRequest(request, stream) {
+    const messages = [];
+    for (const msg of request.messages) {
+      if (msg.role === "tool") {
+        messages.push({
+          role: "tool",
+          tool_call_id: msg.toolCallId,
+          content: this.contentToString(msg.content)
+        });
+      } else if (msg.role === "assistant") {
+        const wireMsg = { role: "assistant" };
+        const textParts = [];
+        const toolCalls = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            textParts.push(block.text);
+          } else if (block.type === "tool_use") {
+            toolCalls.push({
+              id: block.toolUseId,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input)
+              }
+            });
+          }
+        }
+        if (textParts.length > 0) {
+          wireMsg.content = [{ type: "text", text: textParts.join("") }];
+        }
+        if (toolCalls.length > 0) {
+          wireMsg.tool_calls = toolCalls;
+        }
+        messages.push(wireMsg);
+      } else {
+        messages.push({
+          role: msg.role,
+          content: this.contentToString(msg.content)
+        });
+      }
+    }
+    const wire = {
+      model: request.model.modelId,
+      messages,
+      stream
+    };
+    const params = request.parameters;
+    if (params.sampling?.temperature !== void 0)
+      wire.temperature = params.sampling.temperature;
+    if (params.sampling?.topP !== void 0)
+      wire.p = params.sampling.topP;
+    if (params.sampling?.topK !== void 0)
+      wire.k = params.sampling.topK;
+    if (params.constraints?.maxTokens !== void 0)
+      wire.max_tokens = params.constraints.maxTokens;
+    if (params.constraints?.stopSequences !== void 0)
+      wire.stop_sequences = params.constraints.stopSequences;
+    if (params.behavioral?.frequencyPenalty !== void 0) {
+      wire.frequency_penalty = Math.min(1, Math.max(0, params.behavioral.frequencyPenalty));
+    }
+    if (params.behavioral?.presencePenalty !== void 0) {
+      wire.presence_penalty = Math.min(1, Math.max(0, params.behavioral.presencePenalty));
+    }
+    if (params.meta?.seed !== void 0)
+      wire.seed = params.meta.seed;
+    if (params.structural?.tools && params.structural.tools.length > 0) {
+      wire.tools = params.structural.tools.map((t) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description ?? "",
+          parameters: t.parameters ?? { type: "object", properties: {} }
+        }
+      }));
+    }
+    return wire;
+  }
+  contentToString(content) {
+    return content.map((b) => b.type === "text" ? b.text : `[${b.type}]`).join("");
+  }
+  // --- Translation: Cohere Wire → Facade ---
+  translateResponse(data) {
+    const content = [];
+    if (data.message?.content) {
+      for (const block of data.message.content) {
+        if (block.type === "text" && block.text) {
+          content.push({ type: "text", text: block.text });
+        }
+      }
+    }
+    if (data.message?.tool_calls) {
+      for (const tc of data.message.tool_calls) {
+        let parsedInput;
+        try {
+          parsedInput = JSON.parse(tc.function.arguments);
+        } catch {
+          parsedInput = { _raw: tc.function.arguments };
+        }
+        content.push({
+          type: "tool_use",
+          toolUseId: tc.id,
+          name: tc.function.name,
+          input: parsedInput
+        });
+      }
+    }
+    if (content.length === 0) {
+      content.push({ type: "text", text: "" });
+    }
+    return {
+      completionId: data.id,
+      model: data.message?.role === "assistant" ? "cohere" : "cohere",
+      content,
+      finishReason: this.mapFinishReason(data.finish_reason),
+      usage: createUsage(data.usage?.tokens?.input_tokens ?? 0, data.usage?.tokens?.output_tokens ?? 0, data.usage === void 0)
+    };
+  }
+  mapFinishReason(reason) {
+    switch (reason) {
+      case "COMPLETE":
+        return FinishReason.Stop;
+      case "STOP_SEQUENCE":
+        return FinishReason.Stop;
+      case "MAX_TOKENS":
+        return FinishReason.Length;
+      case "TOOL_CALL":
+        return FinishReason.ToolUse;
+      case "ERROR":
+        return FinishReason.Error;
+      case "TIMEOUT":
+        return FinishReason.Error;
+      default:
+        if (reason)
+          console.error(`[cohere] unknown finish_reason: '${reason}'`);
+        return FinishReason.Stop;
+    }
+  }
+  translateError(status, body) {
+    const correlationId = `err_${Date.now().toString(36)}`;
+    switch (status) {
+      case 400:
+        return new FacadeError("precondition.validation_error", "INVALID_PARAMS", body, correlationId, false);
+      case 401:
+        return new FacadeError("precondition.authentication", "AUTH_FAILED", "Invalid Cohere API key", correlationId, false);
+      case 402:
+        return new FacadeError("capacity.quota_exceeded", "QUOTA_EXCEEDED", "Cohere billing limit reached", correlationId, false);
+      case 403:
+        return new FacadeError("precondition.permission", "PERMISSION_DENIED", "Forbidden", correlationId, false);
+      case 404:
+        return new FacadeError("precondition.model_not_found", "MODEL_NOT_FOUND", "Model not found", correlationId, false);
+      case 429:
+        return new FacadeError("capacity.rate_limited", "RATE_LIMITED", "Rate limited", correlationId, true);
+      case 498:
+        return new FacadeError("precondition.validation_error", "TOKEN_DENIED", "Deny-listed token detected", correlationId, false);
+      case 503:
+        return new FacadeError("capacity.overloaded", "OVERLOADED", "Cohere service unavailable", correlationId, true);
+      case 504:
+        return new FacadeError("process.timeout", "TIMEOUT", "Cohere request timed out", correlationId, true);
+      default:
+        return new FacadeError("system.provider_error", "PROVIDER_ERROR", `HTTP ${status}`, correlationId, true);
+    }
+  }
+  buildHeaders() {
+    return {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${this.apiKey}`
+    };
+  }
+};
+
 // dist/index.js
 function wireBlockToFacade(block) {
   switch (block.type) {
@@ -31121,6 +31841,18 @@ if (process.env.ANTHROPIC_API_KEY) {
     apiKey: process.env.ANTHROPIC_API_KEY
   }));
   console.error("[mcp] Anthropic provider registered");
+}
+if (process.env.GEMINI_API_KEY) {
+  registry2.register(new GeminiAdapter({
+    apiKey: process.env.GEMINI_API_KEY
+  }));
+  console.error("[mcp] Gemini provider registered");
+}
+if (process.env.COHERE_API_KEY) {
+  registry2.register(new CohereAdapter({
+    apiKey: process.env.COHERE_API_KEY
+  }));
+  console.error("[mcp] Cohere provider registered");
 }
 if (process.env.MISTRAL_API_KEY) {
   registry2.register(new OpenAICompatAdapter({
