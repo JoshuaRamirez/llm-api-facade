@@ -288,7 +288,7 @@ export class AnthropicAdapter implements CompletionProvider {
       if (!usageEmitted && chunkIndex > 0) {
         yield {
           completionId,
-          chunkIndex,
+          chunkIndex: chunkIndex++,
           blockIndex: 0,
           delta: { type: "text_delta" as const, text: "" },
           finishReason: finishReason ?? FinishReason.Stop,
@@ -419,12 +419,14 @@ export class AnthropicAdapter implements CompletionProvider {
           });
           break;
         case "redacted_thinking":
-          // Pass through as a ThinkingBlock with the opaque data as the thinking field
-          // and an empty signature (the data IS the opaque representation)
+          // Opaque redacted block — cannot be meaningfully inspected or reconstructed.
+          // Stored as ThinkingBlock with "[redacted]" marker text and the opaque data as signature.
+          // This block CANNOT be round-tripped to Anthropic — it will fail integrity checks.
+          // A proper fix requires a RedactedThinkingBlock variant in the facade type system.
           content.push({
             type: "thinking",
-            thinking: block.data ?? "",
-            signature: block.data ?? "",
+            thinking: "[redacted]",
+            signature: block.data ?? "[redacted]",
           });
           break;
       }

@@ -126,8 +126,8 @@ export class CohereAdapter implements CompletionProvider {
 
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data: ")) continue;
-          const payload = trimmed.slice(6);
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+          const payload = trimmed.replace(/^data:\s*/, "");
           if (payload === "[DONE]") continue;
 
           let event: CohereStreamEvent;
@@ -194,6 +194,18 @@ export class CohereAdapter implements CompletionProvider {
               finalFinishReason = this.mapFinishReason(e.delta?.finish_reason);
               inputTokens = e.delta?.usage?.tokens?.input_tokens ?? 0;
               outputTokens = e.delta?.usage?.tokens?.output_tokens ?? 0;
+              // Emit usage on message-end (the authoritative source)
+              if (!usageEmitted) {
+                usageEmitted = true;
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: 0,
+                  delta: { type: "text_delta" as const, text: "" },
+                  finishReason: finalFinishReason ?? FinishReason.Stop,
+                  usage: createUsage(inputTokens, outputTokens, false),
+                };
+              }
               break;
             }
           }

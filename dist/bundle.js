@@ -30940,7 +30940,7 @@ var AnthropicAdapter = class {
       if (!usageEmitted && chunkIndex > 0) {
         yield {
           completionId,
-          chunkIndex,
+          chunkIndex: chunkIndex++,
           blockIndex: 0,
           delta: { type: "text_delta", text: "" },
           finishReason: finishReason ?? FinishReason.Stop,
@@ -31055,8 +31055,8 @@ var AnthropicAdapter = class {
         case "redacted_thinking":
           content.push({
             type: "thinking",
-            thinking: block.data ?? "",
-            signature: block.data ?? ""
+            thinking: "[redacted]",
+            signature: block.data ?? "[redacted]"
           });
           break;
       }
@@ -31192,7 +31192,7 @@ var GeminiAdapter = class {
     let lastUsage;
     let usageEmitted = false;
     let lastFinishReason;
-    const textBlockIndex = 0;
+    let textBlockIndex = 0;
     let toolBlockCount = 0;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -31237,13 +31237,14 @@ var GeminiAdapter = class {
               } else if (part.functionCall) {
                 const toolIdx = textBlockIndex + 1 + toolBlockCount;
                 toolBlockCount++;
+                const thisChunkIndex = chunkIndex++;
                 yield {
                   completionId,
-                  chunkIndex: chunkIndex++,
+                  chunkIndex: thisChunkIndex,
                   blockIndex: toolIdx,
                   delta: {
                     type: "tool_use_delta",
-                    toolUseId: part.functionCall.id ?? `fc_${chunkIndex}`,
+                    toolUseId: part.functionCall.id ?? `fc_${thisChunkIndex}`,
                     name: part.functionCall.name,
                     inputJsonDelta: JSON.stringify(part.functionCall.args ?? {})
                   }
@@ -31262,7 +31263,7 @@ var GeminiAdapter = class {
         } catch {
         }
       }
-      if (!usageEmitted && chunkIndex > 0) {
+      if (!usageEmitted) {
         usageEmitted = true;
         yield {
           completionId,
@@ -31397,6 +31398,9 @@ var GeminiAdapter = class {
     return content.map((b) => b.type === "text" ? b.text : `[${b.type}]`).join("");
   }
   findToolName(request, toolCallId) {
+    if (!toolCallId) {
+      throw new FacadeError("precondition.validation_error", "MISSING_TOOL_ID", "Tool message has no toolCallId", `err_${Date.now().toString(36)}`, false);
+    }
     for (const msg of request.messages) {
       for (const block of msg.content) {
         if (block.type === "tool_use" && block.toolUseId === toolCallId) {
@@ -31595,9 +31599,9 @@ var CohereAdapter = class {
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data: "))
+          if (!trimmed || !trimmed.startsWith("data:"))
             continue;
-          const payload = trimmed.slice(6);
+          const payload = trimmed.replace(/^data:\s*/, "");
           if (payload === "[DONE]")
             continue;
           let event;
@@ -31659,6 +31663,17 @@ var CohereAdapter = class {
               finalFinishReason = this.mapFinishReason(e.delta?.finish_reason);
               inputTokens = e.delta?.usage?.tokens?.input_tokens ?? 0;
               outputTokens = e.delta?.usage?.tokens?.output_tokens ?? 0;
+              if (!usageEmitted) {
+                usageEmitted = true;
+                yield {
+                  completionId,
+                  chunkIndex: chunkIndex++,
+                  blockIndex: 0,
+                  delta: { type: "text_delta", text: "" },
+                  finishReason: finalFinishReason ?? FinishReason.Stop,
+                  usage: createUsage(inputTokens, outputTokens, false)
+                };
+              }
               break;
             }
           }

@@ -112,7 +112,7 @@ export class GeminiAdapter implements CompletionProvider {
     let lastUsage: GeminiUsageMetadata | undefined;
     let usageEmitted = false;
     let lastFinishReason: FinishReason | undefined;
-    const textBlockIndex = 0;
+    let textBlockIndex = 0; // text always at block 0 for Gemini's complete-object SSE
     let toolBlockCount = 0;
 
 
@@ -166,13 +166,14 @@ export class GeminiAdapter implements CompletionProvider {
                 // Each function call is a distinct block after the text block
                 const toolIdx = textBlockIndex + 1 + toolBlockCount;
                 toolBlockCount++;
+                const thisChunkIndex = chunkIndex++;
                 yield {
                   completionId,
-                  chunkIndex: chunkIndex++,
+                  chunkIndex: thisChunkIndex,
                   blockIndex: toolIdx,
                   delta: {
                     type: "tool_use_delta" as const,
-                    toolUseId: part.functionCall.id ?? `fc_${chunkIndex}`,
+                    toolUseId: part.functionCall.id ?? `fc_${thisChunkIndex}`,
                     name: part.functionCall.name,
                     inputJsonDelta: JSON.stringify(part.functionCall.args ?? {}),
                   },
@@ -196,7 +197,7 @@ export class GeminiAdapter implements CompletionProvider {
       }
 
       // Guarantee final usage chunk
-      if (!usageEmitted && chunkIndex > 0) {
+      if (!usageEmitted) {
         usageEmitted = true;
         yield {
           completionId,
@@ -349,6 +350,15 @@ export class GeminiAdapter implements CompletionProvider {
   }
 
   private findToolName(request: NormalizedRequest, toolCallId: string | undefined): string {
+    if (!toolCallId) {
+      throw new FacadeError(
+        "precondition.validation_error",
+        "MISSING_TOOL_ID",
+        "Tool message has no toolCallId",
+        `err_${Date.now().toString(36)}`,
+        false,
+      );
+    }
     // Search conversation history for the tool_use block with matching ID
     for (const msg of request.messages) {
       for (const block of msg.content) {
