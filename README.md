@@ -22,7 +22,7 @@ The server communicates via stdio. Add it to your MCP client config:
 ```json
 {
   "mcpServers": {
-    "llm-facade": {
+    "server": {
       "command": "node",
       "args": ["/path/to/llm-api-facade/dist/index.js"]
     }
@@ -30,7 +30,24 @@ The server communicates via stdio. Add it to your MCP client config:
 }
 ```
 
-Requires [Ollama](https://ollama.com) running locally on the default port (11434).
+Or install as a Claude Code plugin from the [RedJay marketplace](https://github.com/JoshuaRamirez/claude-code-plugins).
+
+### Provider Configuration
+
+Providers auto-register when their env vars are set. Ollama is always on.
+
+| Provider | Env Var | Adapter |
+|----------|---------|---------|
+| Ollama (local) | Always on | OpenAI-compat |
+| OpenAI | `OPENAI_API_KEY` | OpenAI-compat |
+| Anthropic | `ANTHROPIC_API_KEY` | Dedicated |
+| Google Gemini | `GEMINI_API_KEY` | Dedicated |
+| Cohere | `COHERE_API_KEY` | Dedicated |
+| Mistral | `MISTRAL_API_KEY` | OpenAI-compat |
+| xAI (Grok) | `XAI_API_KEY` | OpenAI-compat |
+| vLLM | `VLLM_BASE_URL` | OpenAI-compat |
+| LM Studio | `LMSTUDIO_BASE_URL` | OpenAI-compat |
+| llama.cpp | `LLAMACPP_BASE_URL` | OpenAI-compat |
 
 ## MCP Tools
 
@@ -57,17 +74,21 @@ Layer 1 normalizes (many shapes into one). Layer 2 organizes (provider-specific 
 
 ## Current State
 
-**Implemented and tested (32 scenarios against Ollama):**
+**Implemented and tested (50 scenarios across Ollama + OpenAI):**
 - Text completion (batch and streaming)
 - All sampling parameters (temperature, top_p, frequency/presence penalty, seed, stop sequences)
 - Tool calling (single-turn, multi-turn with results, multiple tools, correct tool selection)
 - Structured output (JSON mode, JSON Schema with constrained output)
 - Content block model (TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock, ImageBlock)
 - Error taxonomy (4 genera, 14 species)
-- OpenAI-compatible adapter (Ollama, OpenAI, vLLM, LM Studio, llama.cpp, Mistral, xAI)
 
-**Documented but not yet implemented:**
-- Anthropic, Gemini, Cohere adapters
+**Adapters (all 11 providers covered):**
+- OpenAI-compatible adapter: Ollama, OpenAI, Mistral, xAI, vLLM, LM Studio, llama.cpp
+- Anthropic adapter: system-as-parameter, content blocks, role compression, named SSE streaming
+- Gemini adapter: parts-based content, "model" role, functionCall detection, API key in header
+- Cohere adapter: flat response, uppercase finish reasons, named SSE events
+
+**Not yet implemented:**
 - Extension system (cache_control, safety_settings, reasoning_config, structured_output, token_details)
 - MCP resources (models://catalog, config://state, session://{id})
 - validate_request, estimate_tokens, get_model_info tools

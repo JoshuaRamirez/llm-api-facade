@@ -8,7 +8,7 @@ An MCP server providing a universal abstraction layer for any LLM backend (local
 
 - **Facade surface**: MCP tools (`complete`, `stream_complete`, `list_models`, `get_model_info`, `validate_request`, `estimate_tokens`) and resources (`models://catalog`, `config://state`, `session://{id}`)
 - **The Seam**: Load-bearing boundary between universal domain and provider-specific integration. Nothing provider-specific crosses upward.
-- **Integration Plane**: Not yet implemented. Will contain provider adapters implementing `ICompletionProvider`.
+- **Integration Plane**: 4 adapters implementing `ICompletionProvider` — OpenAI-compatible (covers 7 providers), Anthropic, Gemini, Cohere.
 
 ## Key Principles
 
@@ -23,7 +23,7 @@ An MCP server providing a universal abstraction layer for any LLM backend (local
 
 ## Project Phase
 
-Phase 2: Implementation. TypeScript MCP server with OpenAI-compatible adapter, tested against Ollama (32 scenarios verified). Conceptual model complete (Phase 1).
+Phase 2: Implementation. TypeScript MCP server with 4 adapters covering all 11 providers from the architecture docs. Tested against Ollama (32 scenarios) and OpenAI (18 scenarios). Conceptual model complete (Phase 1).
 
 ## Documentation
 
